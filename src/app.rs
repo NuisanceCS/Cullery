@@ -58,6 +58,7 @@ const GRID_KEYS: &[(&str, &str)] = &[
     ("Delete", "Delete the selected photos (asks first)"),
     ("Esc", "Clear the selection, or cancel Select Range"),
     ("Ctrl + O", "Open a folder"),
+    ("Ctrl + ,", "Open or close Settings"),
 ];
 const VIEWER_KEYS: &[(&str, &str)] = &[
     ("←  /  →", "Previous / next photo"),
@@ -424,9 +425,12 @@ impl App {
         self.set_picked(&[shot], pick);
     }
 
-    /// Picks (copies JPG + RAW) or unpicks (moves the copies to the Recycle Bin) shots.
+    /// Picks or unpicks shots. Picks are always remembered; with an export folder set,
+    /// picking also copies JPG + RAW there (and unpicking moves those copies to the
+    /// Recycle Bin). Without one, nothing is asked: picks are just marked, ready for
+    /// View Picked and dragging into an editor.
     fn set_picked(&mut self, shots: &[usize], pick: bool) {
-        let Some(dest) = self.export_dir_or_ask() else { return };
+        let dest = self.settings.export_dir.clone();
         for &shot in shots {
             if self.picked.contains(&shot) == pick {
                 continue;
@@ -434,13 +438,26 @@ impl App {
             let files: Vec<PathBuf> = self.shots[shot].files().cloned().collect();
             if pick {
                 self.picked.insert(shot);
-                self.exporter.copy(shot, files, dest.clone(), None);
+                if let Some(dest) = &dest {
+                    self.exporter.copy(shot, files, dest.clone(), None);
+                }
             } else {
                 self.picked.remove(&shot);
-                self.exporter.remove(shot, files, dest.clone());
+                if let Some(dest) = &dest {
+                    self.exporter.remove(shot, files, dest.clone());
+                }
             }
         }
         self.save_picks();
+    }
+
+    /// Hover text for picking: what picking does with the current export setting.
+    fn pick_tip(&self) -> &'static str {
+        if self.settings.export_dir.is_some() {
+            "Pick: mark and copy JPG + RAW to the export folder"
+        } else {
+            "Pick: mark as a keeper (set an export folder to also copy picks there)"
+        }
     }
 
     /// Grid: picks every selected shot, or unpicks them if they're all picked already.
@@ -889,7 +906,7 @@ impl App {
             (0 | 1, _) => "Pick".to_string(),
             (n, _) => format!("Pick {n}"),
         };
-        let tip = if all_picked { "Unpick the selected photos" } else { "Copy the selected photos' JPG + RAW to the export folder" };
+        let tip = if all_picked { "Unpick the selected photos" } else { self.pick_tip() };
         if pick_button(ui, &p, &label, all_picked, n > 0).on_hover_text(tip).clicked() {
             self.pick_selected();
         }
@@ -1219,7 +1236,7 @@ impl App {
         }
         let picked = self.picked.contains(&self.current);
         let label = if picked { "Picked" } else { "Pick" };
-        if pick_button(ui, &p, label, picked, true).on_hover_text("Copy JPG + RAW to the export folder").clicked() {
+        if pick_button(ui, &p, label, picked, true).on_hover_text(self.pick_tip()).clicked() {
             self.toggle_pick(self.current);
         }
         if chevron_button(ui, &p, false).on_hover_text("Next (→)").clicked() {
@@ -1522,10 +1539,12 @@ impl App {
 
         // Pick circle (top-right), registered after the tile so it takes the click.
         let circle_rect = Rect::from_min_size(pos2(thumb_rect.max.x - 44.0, thumb_rect.min.y), Vec2::splat(44.0));
-        let circle = (!selecting).then(|| {
-            ui.interact(circle_rect, ui.id().with(("pick", item.shot, item.raw)), Sense::click())
-                .on_hover_text(if picked { "Unpick (moves the copies to the Recycle Bin)" } else { "Pick: copy JPG + RAW to the export folder" })
-        });
+        let tip = match (picked, self.settings.export_dir.is_some()) {
+            (true, true) => "Unpick (moves the copies to the Recycle Bin)",
+            (true, false) => "Unpick",
+            (false, _) => self.pick_tip(),
+        };
+        let circle = (!selecting).then(|| ui.interact(circle_rect, ui.id().with(("pick", item.shot, item.raw)), Sense::click()).on_hover_text(tip));
 
         let painter = ui.painter();
         // Selection: a soft box around the whole tile, like Finder / Explorer.
@@ -1746,7 +1765,8 @@ impl App {
                 (true, false) => s.image_kind(),
                 _ => s.raw_kind(),
             };
-            let g = painter.layout_no_wrap(format!("Picked · {copied} copied"), theme::font(13.0), Color32::WHITE);
+            let text = if self.settings.export_dir.is_some() { format!("Picked · {copied} copied") } else { "Picked".to_string() };
+            let g = painter.layout_no_wrap(text, theme::font(13.0), Color32::WHITE);
             let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 20.0), g.size() + vec2(44.0, 14.0));
             painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
             let c = pos2(r.min.x + 17.0, r.center().y);
@@ -1845,6 +1865,7 @@ impl App {
             back: bool,
             delete: bool,
             open: bool,
+            settings: bool,
             export: bool,
             select_all: bool,
             esc: bool,
@@ -1868,9 +1889,18 @@ impl App {
             end: i.key_pressed(KeyCode::End),
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
             delete: i.key_pressed(KeyCode::Delete),
+            settings: i.modifiers.command && i.key_pressed(KeyCode::Comma),
         });
         // While the delete confirmation is up, it gets the keys (Esc cancels it).
         if self.confirm_delete.is_some() {
+            k = Keys::default();
+        }
+        // Ctrl + , opens or closes Settings, as in many Windows apps.
+        if k.settings {
+            self.settings_page = match self.settings_page {
+                Some(_) => None,
+                None => Some(SettingsPage::DragDrop),
+            };
             k = Keys::default();
         }
         // While Settings is open, keys don't reach the grid or viewer; Esc or the mouse
@@ -2976,6 +3006,22 @@ mod tests {
         assert!(h.app.confirm_delete.is_none());
         assert!(dir.join("IMG_0000.JPG").exists() && dir.join("IMG_0000.CR3").exists());
         assert!(h.app.selected.contains(&0), "Esc on the dialog doesn't clear the selection");
+        cleanup(&dir);
+    }
+
+    /// Picking works with no export folder set: the photo is marked (and remembered)
+    /// without asking for a folder or copying anything.
+    #[test]
+    fn picking_without_export_folder_just_marks() {
+        let (mut h, dir) = harness_with_files("pick-no-export");
+        h.app.settings.export_dir = None;
+        h.app.selected = [1, 3].into_iter().collect();
+        h.app.pick_selected();
+        assert_eq!(h.app.picked, [1, 3].into_iter().collect());
+        assert_eq!(h.app.exporter.pending(), 0, "nothing copied");
+        assert_eq!(picks::load(&dir).unwrap(), ["img_0001", "img_0003"].map(String::from).into_iter().collect());
+        h.app.pick_selected();
+        assert!(h.app.picked.is_empty(), "picking again unpicks");
         cleanup(&dir);
     }
 

@@ -137,7 +137,7 @@ pub const APPLE_DARK: Palette = Palette {
     bg: rgb(0x1E1E1E),
     viewer_bg: rgb(0x141414),
     bar: rgb(0x2A2A2A),
-    separator: rgb(0x3D3D3F),
+    separator: rgb(0x48484A),
     control: rgb(0x3A3A3C),
     control_border: rgb(0x4A4A4D),
     card: rgb(0x2C2C2E),
@@ -173,7 +173,7 @@ pub const APPLE_LIGHT: Palette = Palette {
     bar: rgb(0xF5F5F7),
     separator: rgb(0xD2D2D7),
     control: rgb(0xFFFFFF),
-    control_border: rgb(0xD2D2D7),
+    control_border: rgb(0xC4C4C9),
     card: rgb(0xF5F5F7),
     tile: rgb(0xE8E8ED),
     label: rgb(0x1D1D1F),
@@ -205,9 +205,9 @@ pub const WIN11_DARK: Palette = Palette {
     bg: rgb(0x191919),
     viewer_bg: rgb(0x141414),
     bar: rgb(0x202020),
-    separator: rgb(0x2E2E2E),
+    separator: rgb(0x4A4A4A),
     control: rgb(0x2D2D2D),
-    control_border: rgb(0x3A3A3A),
+    control_border: rgb(0x575757),
     card: rgb(0x2B2B2B),
     tile: rgb(0x262626),
     label: rgb(0xFFFFFF),
@@ -239,9 +239,9 @@ pub const WIN11_LIGHT: Palette = Palette {
     bg: rgb(0xFFFFFF),
     viewer_bg: rgb(0xF3F3F3),
     bar: rgb(0xF3F3F3),
-    separator: rgb(0xE5E5E5),
+    separator: rgb(0xD0D0D0),
     control: rgb(0xFBFBFB),
-    control_border: rgb(0xE0E0E0),
+    control_border: rgb(0xC8C8C8),
     card: rgb(0xF9F9F9),
     tile: rgb(0xEBEBEB),
     label: rgb(0x1B1B1B),
@@ -273,7 +273,7 @@ pub const WIN10_DARK: Palette = Palette {
     bg: rgb(0x191919),
     viewer_bg: rgb(0x111111),
     bar: rgb(0x2B2B2B),
-    separator: rgb(0x3F3F3F),
+    separator: rgb(0x474747),
     control: rgb(0x333333),
     control_border: rgb(0x555555),
     card: rgb(0x2B2B2B),
@@ -308,7 +308,7 @@ pub const WIN10_LIGHT: Palette = Palette {
     bg: rgb(0xFFFFFF),
     viewer_bg: rgb(0xF0F0F0),
     bar: rgb(0xF0F0F0),
-    separator: rgb(0xDADBDC),
+    separator: rgb(0xC8C9CA),
     control: rgb(0xE1E1E1),
     control_border: rgb(0xADADAD),
     card: rgb(0xF0F0F0),
@@ -495,6 +495,31 @@ mod tests {
         };
         let (x, y) = (lum(a), lum(b));
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// Dividing lines and control outlines (buttons, radio buttons, fields) stand out
+    /// from the surfaces they're drawn on — in Windows 11 dark they were nearly
+    /// invisible in Settings.
+    #[test]
+    fn lines_and_outlines_are_visible() {
+        let mut too_faint = Vec::new();
+        for id in ThemeId::ALL {
+            let p = id.palette();
+            for (what, line, surface, min) in [
+                ("divider on card", p.separator, p.card, 1.35),
+                ("divider on bar", p.separator, p.bar, 1.25),
+                ("divider on background", p.separator, p.bg, 1.25),
+                ("outline on card", p.control_border, p.card, 1.5),
+                ("outline on background", p.control_border, p.bg, 1.5),
+            ] {
+                let c = contrast(line, surface);
+                println!("{:<20} {what:<24} {c:.2}", id.name());
+                if c < min {
+                    too_faint.push(format!("{}: {what} {c:.2} < {min}", id.name()));
+                }
+            }
+        }
+        assert!(too_faint.is_empty(), "too faint:\n{}", too_faint.join("\n"));
     }
 
     /// Every theme's text is readable: body and secondary text on the background and
