@@ -7,7 +7,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
 struct Job {
-    shot: usize,
     files: Vec<PathBuf>,
     dest: PathBuf,
     batch: Option<u64>,
@@ -16,8 +15,6 @@ struct Job {
 /// A finished copy. `batch` groups the copies of one Quick Export, so the UI can
 /// confirm when all of them are done.
 pub struct Done {
-    #[allow(dead_code)] // reported for completeness; the UI only needs batch + result
-    pub shot: usize,
     pub batch: Option<u64>,
     pub result: Result<(), String>,
 }
@@ -38,7 +35,7 @@ impl Exporter {
             .spawn(move || {
                 for job in job_rx {
                     let result = copy_files(&job.files, &job.dest);
-                    let _ = done_tx.send(Done { shot: job.shot, batch: job.batch, result });
+                    let _ = done_tx.send(Done { batch: job.batch, result });
                     ctx.request_repaint();
                 }
             })
@@ -46,9 +43,9 @@ impl Exporter {
         Self { jobs: Some(job_tx), done: done_rx, thread: Some(thread), pending: 0 }
     }
 
-    pub fn copy(&mut self, shot: usize, files: Vec<PathBuf>, dest: PathBuf, batch: Option<u64>) {
+    pub fn copy(&mut self, files: Vec<PathBuf>, dest: PathBuf, batch: Option<u64>) {
         if let Some(jobs) = &self.jobs {
-            if jobs.send(Job { shot, files, dest, batch }).is_ok() {
+            if jobs.send(Job { files, dest, batch }).is_ok() {
                 self.pending += 1;
             }
         }
@@ -145,31 +142,38 @@ pub fn delete_files(files: &[PathBuf], permanent: bool) -> Result<(), String> {
     }
 }
 
-/// Whether `path` is on a removable drive (memory card, USB stick), where Windows has
-/// no Recycle Bin.
+/// Whether `path` is somewhere Windows has no Recycle Bin: a removable drive (memory
+/// card, USB stick) or a network drive.
 #[cfg(windows)]
-pub fn on_removable_drive(path: &Path) -> bool {
+pub fn has_no_recycle_bin(path: &Path) -> bool {
     use std::path::Component;
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::GetDriveTypeW;
     const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_REMOTE: u32 = 4;
     let Some(Component::Prefix(prefix)) = path.components().next() else { return false };
     let root = HSTRING::from(format!("{}\\", prefix.as_os_str().to_string_lossy()));
     // SAFETY: reads the type of a drive given its root path.
-    unsafe { GetDriveTypeW(&root) == DRIVE_REMOVABLE }
+    matches!(unsafe { GetDriveTypeW(&root) }, DRIVE_REMOVABLE | DRIVE_REMOTE)
 }
 
 #[cfg(not(windows))]
-pub fn on_removable_drive(_path: &Path) -> bool {
+pub fn has_no_recycle_bin(_path: &Path) -> bool {
     false
 }
 
-/// A file in the export folder counts as a copy of `src` when it has the same size.
+/// A file in the export folder counts as a copy of `src` when it has the same size and
+/// was last modified at the same time (copying keeps that time). Memory cards can store
+/// local time and FAT rounds to 2 seconds, so whole-hour differences (daylight saving,
+/// time zones) and small ones still match.
 fn is_copy_of(target: &Path, src: &Path) -> bool {
-    match (std::fs::metadata(target), std::fs::metadata(src)) {
-        (Ok(t), Ok(s)) => t.is_file() && t.len() == s.len(),
-        _ => false,
+    let (Ok(t), Ok(s)) = (std::fs::metadata(target), std::fs::metadata(src)) else { return false };
+    if !t.is_file() || t.len() != s.len() {
+        return false;
     }
+    let (Ok(t), Ok(s)) = (t.modified(), s.modified()) else { return true };
+    let gap = t.duration_since(s).unwrap_or_else(|e| e.duration()).as_secs() % 3600;
+    gap <= 2 || gap >= 3598
 }
 
 #[cfg(test)]
@@ -180,11 +184,35 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn detects_removable_drives() {
-        assert!(!on_removable_drive(Path::new(r"C:\Users")));
+        assert!(!has_no_recycle_bin(Path::new(r"C:\Users")));
         let card = Path::new(r"F:\DCIM");
         if card.exists() {
-            println!("F:\\DCIM removable: {}", on_removable_drive(card));
+            println!("F:\\DCIM has no Recycle Bin: {}", has_no_recycle_bin(card));
         }
+    }
+
+    /// Same name and size but taken at a different time is a different photo; a
+    /// whole-hour difference (daylight saving on a memory card) is still the same one.
+    #[test]
+    fn a_different_photo_of_the_same_size_is_not_a_copy() {
+        use std::time::{Duration, SystemTime};
+        let base = std::env::temp_dir().join(format!("cullery-copy-time-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let (src, other) = (base.join("a.jpg"), base.join("b.jpg"));
+        std::fs::write(&src, b"same size").unwrap();
+        std::fs::write(&other, b"same size").unwrap();
+        let when = SystemTime::now() - Duration::from_secs(100_000);
+        let stamp = |path: &Path, time: SystemTime| {
+            std::fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(time).unwrap();
+        };
+        stamp(&src, when);
+        stamp(&other, when + Duration::from_secs(3600));
+        let dst_shifted = is_copy_of(&other, &src);
+        stamp(&other, when + Duration::from_secs(4000));
+        let different = is_copy_of(&other, &src);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(dst_shifted);
+        assert!(!different);
     }
 
     /// Copying the same files again makes no new copies; a different file that already

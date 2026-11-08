@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::raw;
 
 /// Camera images that pair with a RAW of the same name.
-const CAMERA_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heic", "heif"];
+pub const CAMERA_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heic", "heif"];
 /// Images shown on their own, never paired.
 const OTHER_IMAGE_EXTENSIONS: &[&str] = &["png", "gif", "webp", "tif", "tiff", "bmp", "avif"];
 
@@ -76,13 +76,16 @@ fn extension(path: Option<&Path>) -> Option<String> {
 
 /// Lists the shots in `dir` (not its subfolders), sorted alphabetically by name.
 pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    // A set order, so the same file pairs up every time (see `taken` below).
+    files.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+
     let mut shots: BTreeMap<String, Shot> = BTreeMap::new();
-    for entry in std::fs::read_dir(dir)? {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
+    for path in files {
         let (Some(stem), Some(ext), Some(file)) = (
             path.file_stem().and_then(|s| s.to_str()),
             path.extension().and_then(|e| e.to_str()),
@@ -101,7 +104,10 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
         if !is_camera && !is_other && !is_raw {
             continue;
         }
-        let key = if is_other { file.to_lowercase() } else { stem.to_lowercase() };
+        let stem_key = stem.to_lowercase();
+        // A second image or RAW of the same name (IMG_1.JPG + IMG_1.HEIC) is its own shot.
+        let taken = shots.get(&stem_key).is_some_and(|s| if is_raw { s.raw.is_some() } else { s.image.is_some() });
+        let key = if is_other || taken { file.to_lowercase() } else { stem_key };
         let shot = shots.entry(key.clone()).or_insert_with(|| Shot {
             name: stem.to_owned(),
             key,
@@ -136,6 +142,8 @@ mod tests {
             "DSC_0005.NEF",
             "IMG_0006.HEIC",
             "IMG_0006.CR3",
+            "IMG_0007.JPG",
+            "IMG_0007.HEIC",
             "IMG_0001.png",
             "anim.gif",
             "notes.txt",
@@ -160,6 +168,8 @@ mod tests {
                 ("img_0003".into(), "JPG".into(), true),
                 ("img_0004".into(), "JPG".into(), false),
                 ("img_0006".into(), "HEIC".into(), true),
+                ("img_0007".into(), "HEIC".into(), false),
+                ("img_0007.jpg".into(), "JPG".into(), false),
             ]
         );
         assert!(shots[0].image.is_some() && !shots[0].is_camera_image());

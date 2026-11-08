@@ -204,13 +204,30 @@ struct TextMask {
     cover: Vec<u8>,
 }
 
+/// The description of a 32-bit bitmap, top row first.
+#[cfg(windows)]
+pub fn bitmap_info(w: i32, h: i32) -> windows::Win32::Graphics::Gdi::BITMAPINFO {
+    use windows::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB};
+    BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[cfg(windows)]
 fn text_mask(text: &str, px: i32) -> Option<TextMask> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
-        SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, LOGFONTW, TRANSPARENT,
+        SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, LOGFONTW, TRANSPARENT,
     };
     use windows::Win32::Foundation::COLORREF;
 
@@ -231,18 +248,7 @@ fn text_mask(text: &str, px: i32) -> Option<TextMask> {
         let mut rect = RECT::default();
         DrawTextW(dc, &mut wide, &mut rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
         let (w, h) = (rect.right.max(1), rect.bottom.max(1));
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+        let info = bitmap_info(w, h);
         let mut bits = std::ptr::null_mut();
         let mut result = None;
         if let Ok(bitmap) = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {

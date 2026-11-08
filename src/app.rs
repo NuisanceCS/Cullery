@@ -361,14 +361,10 @@ impl App {
                 self.original = None;
                 self.failed.clear();
                 self.shots = shots;
-                self.selected.clear();
-                self.select_anchor = None;
-                self.range = None;
-                self.range_mode = RangeMode::Off;
-                self.screen = Screen::Grid;
-                self.current = 0;
-                self.view_anchor = None;
-                self.reset_zoom();
+                self.reset_view();
+                // The memory card list is only on the start screen, which never comes
+                // back once a folder is open; dropping this stops its background scans.
+                self.cards = Arc::default();
                 self.message = if self.shots.is_empty() {
                     Some(("No JPG or RAW files in this folder".into(), false))
                 } else {
@@ -383,6 +379,23 @@ impl App {
             }
             Err(e) => self.error(format!("Couldn't open {}: {e}", dir.display())),
         }
+    }
+
+    /// Everything about what's on screen that refers to the previous folder's photos.
+    fn reset_view(&mut self) {
+        self.selected.clear();
+        self.select_anchor = None;
+        self.range = None;
+        self.range_mode = RangeMode::Off;
+        self.view_picked = false;
+        self.confirm_delete = None;
+        self.screen = Screen::Grid;
+        self.current = 0;
+        self.view_anchor = None;
+        self.scroll_to_current = false;
+        self.pending_scroll = Some(0.0);
+        self.last_tile_click = None;
+        self.reset_zoom();
     }
 
     fn choose_export(&mut self) -> bool {
@@ -411,34 +424,10 @@ impl App {
     /// Picks are remembered per folder, so they survive closing the app.
     fn reload_picks(&mut self) {
         self.picked.clear();
-        let Some(folder) = &self.folder else { return };
-        match picks::load(folder) {
-            Some(names) => {
-                for (i, shot) in self.shots.iter().enumerate() {
-                    if names.contains(&shot.key) {
-                        self.picked.insert(i);
-                    }
-                }
-            }
-            None => {
-                // Folders picked in before picks were saved: count what's in the export folder.
-                let Some(dest) = &self.settings.export_dir else { return };
-                let Ok(entries) = std::fs::read_dir(dest) else { return };
-                let names: HashSet<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_lowercase())
-                    .collect();
-                for (i, shot) in self.shots.iter().enumerate() {
-                    let exported = shot.files().any(|f| {
-                        f.file_name().is_some_and(|n| names.contains(&n.to_string_lossy().to_lowercase()))
-                    });
-                    if exported {
-                        self.picked.insert(i);
-                    }
-                }
-                if !self.picked.is_empty() {
-                    self.save_picks();
-                }
+        let Some(names) = self.folder.as_deref().and_then(picks::load) else { return };
+        for (i, shot) in self.shots.iter().enumerate() {
+            if names.contains(&shot.key) {
+                self.picked.insert(i);
             }
         }
     }
@@ -466,7 +455,7 @@ impl App {
                 self.picked.insert(shot);
                 if let Some(dest) = &dest {
                     let files = self.export_files(shot);
-                    self.exporter.copy(shot, files, dest.clone(), None);
+                    self.exporter.copy(files, dest.clone(), None);
                 }
             } else {
                 self.picked.remove(&shot);
@@ -519,7 +508,7 @@ impl App {
         self.batches.insert(batch, Batch { remaining: shots.len(), shots: shots.len(), failed: false, dest: dest.clone() });
         for shot in shots {
             let files = self.export_files(shot);
-            self.exporter.copy(shot, files, dest.clone(), Some(batch));
+            self.exporter.copy(files, dest.clone(), Some(batch));
         }
     }
 
@@ -536,9 +525,14 @@ impl App {
     fn back_to_grid(&mut self) {
         self.screen = Screen::Grid;
         self.scroll_to_current = true;
+        // Select the photo just viewed, if it's still on the grid (it may have been
+        // deleted, or unpicked in View Picked).
         self.selected.clear();
-        self.selected.insert(self.current);
-        self.select_anchor = Some(self.current);
+        self.select_anchor = None;
+        if self.working_set().contains(&self.current) {
+            self.selected.insert(self.current);
+            self.select_anchor = Some(self.current);
+        }
         self.fulls.clear();
         self.original = None;
         self.reset_zoom();
@@ -689,7 +683,7 @@ impl App {
             }
         }
 
-        while let Some(Done { batch, result, .. }) = self.exporter.try_recv() {
+        while let Some(Done { batch, result }) = self.exporter.try_recv() {
             // A failed copy is reported; the pick itself stays marked.
             if let Err(e) = &result {
                 self.error(e.clone());
@@ -834,11 +828,11 @@ impl App {
             Some(dir) => {
                 let folder = TextFormat { font_id: theme::font_semibold(13.5), color: p.tint, ..Default::default() };
                 job.append(&folder_name(dir), 0.0, folder);
-                format!("Picks are copied to {}\nClick to change", dir.display())
+                format!("Exports go to {}\nClick to change", dir.display())
             }
             None => {
                 job.append("Not Set", 0.0, TextFormat { color: p.label2, ..plain });
-                "Choose where picks are copied".to_string()
+                "Choose where photos are exported".to_string()
             }
         };
         let button = Button::new(job)
@@ -875,7 +869,7 @@ impl App {
         let mut job = LayoutJob::default();
         job.append("Quick Export", 0.0, TextFormat { font_id: theme::font(13.5), color: p.label, ..Default::default() });
         job.append("   Ctrl E", 0.0, key_hint(12.0, p.label2));
-        let tip = "Copy the selected photos' JPG + RAW to the export folder";
+        let tip = format!("Copy {} to the export folder", self.settings.export_files.label());
         if ui.add_enabled(enabled, Button::new(job)).on_hover_text(tip).clicked() {
             self.quick_export();
         }
@@ -884,9 +878,11 @@ impl App {
     fn grid_controls(&mut self, ui: &mut Ui) {
         let p = self.p;
         let bar = ui.max_rect();
-        self.quick_export_button(ui, !self.selected.is_empty());
-
+        // While choosing a range, the grid doesn't show the selection, so nothing acts on it.
         let selecting = self.range_mode != RangeMode::Off;
+        let can_act = !self.selected.is_empty() && !selecting;
+        self.quick_export_button(ui, can_act);
+
         let mut range_btn = Button::new(RichText::new("Select Range").color(if selecting { p.on_accent } else { p.label }));
         if selecting {
             range_btn = range_btn.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
@@ -902,7 +898,7 @@ impl App {
         size_icon(ui, &p, 9.0);
         ui.spacing_mut().slider_width = 110.0;
         let size = ui.add(Slider::new(&mut self.settings.tile_width, 120.0..=360.0).show_value(false));
-        if size.drag_stopped() || size.lost_focus() {
+        if self.settings.tile_width_changed() && !size.is_pointer_button_down_on() {
             self.settings.save();
         }
         size_icon(ui, &p, 15.0);
@@ -913,7 +909,7 @@ impl App {
             ui.add_space(pad);
         }
         let tip = "Delete the selected photos and their RAW files (Delete)";
-        if trash_button(ui, &p, !self.selected.is_empty()).on_hover_text(tip).clicked() {
+        if trash_button(ui, &p, can_act).on_hover_text(tip).clicked() {
             self.request_delete();
         }
         ui.add_space(TRASH_GAP - ui.spacing().item_spacing.x);
@@ -925,7 +921,7 @@ impl App {
             (n, _) => format!("Pick {n}"),
         };
         let tip = if all_picked { "Unpick the selected photos" } else { self.pick_tip() };
-        if pick_button(ui, &p, &label, all_picked, n > 0).on_hover_text(tip).clicked() {
+        if pick_button(ui, &p, &label, all_picked, can_act).on_hover_text(tip).clicked() {
             self.pick_selected();
         }
 
@@ -963,12 +959,12 @@ impl App {
         let paths = self.drag_paths(&shots);
         self.last_drag = paths.iter().cloned().collect();
         let (title, count, note) = drag_out_hint(&shots.iter().map(|&s| &self.shots[s]).collect::<Vec<_>>(), self.settings.drag_files);
-        // The window can't redraw while Windows runs the drag, so this frame shows the
-        // overlay and the next one hands the drag to Windows (the overlay stays on screen
-        // until the drop).
         // The stack under the cursor: the photo grabbed in front, then the rest.
         let order: Vec<usize> = std::iter::once(shot).chain(shots.iter().copied().filter(|&s| s != shot)).collect();
         let stack: Vec<PathBuf> = order.iter().filter_map(|&s| self.shots[s].display_path().cloned()).take(3).collect();
+        // The window can't redraw while Windows runs the drag, so this frame shows the
+        // overlay and the next one hands the drag to Windows (the overlay stays on screen
+        // until the drop).
         self.pending_drag = Some(PendingDrag { paths, stack, photos: shots.len(), title, count, note, shown: false });
         self.last_tile_click = None;
     }
@@ -999,24 +995,12 @@ impl App {
         let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("drag-out-overlay")));
         painter.rect_filled(screen, 0, Color32::from_black_alpha(170));
 
-        let lines = [
+        let lines = vec![
             painter.layout_no_wrap(drag.title.clone(), theme::font_semibold(18.0), p.label),
             painter.layout_no_wrap(drag.count.clone(), theme::font_semibold(14.0), p.tint),
             painter.layout_no_wrap(drag.note.clone(), theme::font(13.0), p.label2),
         ];
-        let gaps = [10.0, 4.0];
-        let width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max) + 64.0;
-        let height = 28.0 + lines.iter().map(|g| g.size().y).sum::<f32>() + gaps.iter().sum::<f32>() + 28.0;
-        let card = Rect::from_center_size(screen.center(), vec2(width, height));
-        let r = theme::around(p.r_card, 2);
-        painter.rect_filled(card, r, p.card);
-        painter.rect_stroke(card, r, Stroke::new(1.0_f32, p.separator), StrokeKind::Inside);
-        let mut y = card.min.y + 28.0;
-        for (i, g) in lines.into_iter().enumerate() {
-            let h = g.size().y;
-            painter.galley(pos2(card.center().x - g.size().x / 2.0, y), g, p.label);
-            y += h + gaps.get(i).copied().unwrap_or(0.0);
-        }
+        center_card(&painter, screen.center(), &p, lines, &[10.0, 4.0], vec2(32.0, 28.0), p.separator);
         ctx.request_repaint();
     }
 
@@ -1074,7 +1058,7 @@ impl App {
         let jpgs = images.len();
         let raws = shots.iter().filter(|&&s| self.shots[s].raw.is_some()).count();
         let n = shots.len();
-        let permanent = self.folder.as_deref().is_some_and(export::on_removable_drive);
+        let permanent = self.folder.as_deref().is_some_and(export::has_no_recycle_bin);
         // "JPG"/"PNG"/… when they're all one type, else "image".
         let kind = match images.first().map(|s| s.image_kind()) {
             Some(k) if images.iter().all(|s| s.image_kind() == k) => k,
@@ -1104,7 +1088,7 @@ impl App {
             ),
         };
         let where_to = if permanent {
-            "This is a memory card, which has no Recycle Bin: the files will be deleted permanently. This can't be undone."
+            "Memory cards and network drives have no Recycle Bin: the files will be deleted permanently. This can't be undone."
         } else {
             "They'll go to the Recycle Bin, where you can restore them."
         };
@@ -1120,7 +1104,7 @@ impl App {
                 ui.label(RichText::new(what).color(p.label));
                 ui.add_space(4.0);
                 ui.label(RichText::new(where_to).color(if permanent { p.danger } else { p.label2 }));
-                if self.shots.len() > 0 && shots.iter().any(|s| self.picked.contains(s)) {
+                if shots.iter().any(|s| self.picked.contains(s)) {
                     ui.add_space(4.0);
                     ui.label(RichText::new("Copies already in your export folder are kept.").color(p.label2));
                 }
@@ -1339,7 +1323,8 @@ impl App {
                     ui.add_space(24.0);
                     section_label(ui, &p, "Memory Cards");
                     for card in &cards {
-                        let sub = format!("{} JPG · {} RAW", card.jpgs, card.raws);
+                        let heics = if card.heics > 0 { format!("{} HEIC · ", card.heics) } else { String::new() };
+                        let sub = format!("{} JPG · {heics}{} RAW", card.jpgs, card.raws);
                         if list_row(ui, &p, &card.path.display().to_string(), Some(&sub), None).clicked() {
                             open = Some(card.path.clone());
                         }
@@ -1472,7 +1457,11 @@ impl App {
                 && i.pointer.interact_pos().is_some_and(|pos| {
                     view.contains(pos) && !drawn.iter().any(|(_, r)| r.contains(pos))
                 })
-        });
+        }) && {
+            // Not when the click landed on something floating over the grid (Settings, a menu).
+            let top = ui.input(|i| i.pointer.interact_pos()).and_then(|pos| ui.ctx().layer_id_at(pos));
+            top.map_or(true, |layer| layer == ui.layer_id())
+        };
         if background_click && actions.is_empty() && self.range_mode == RangeMode::Off {
             self.selected.clear();
         }
@@ -1516,15 +1505,21 @@ impl App {
                 Action::DragOut(shot) => self.drag_out(shot, &items),
                 Action::TogglePick(shot) => self.toggle_pick(shot),
                 Action::Mark(shot) => match self.range_mode {
-                    RangeMode::PickEnd(start) => {
-                        self.range = Some((start.min(shot), start.max(shot)));
-                        self.range_mode = RangeMode::Off;
-                    }
+                    RangeMode::PickEnd(start) => self.finish_range(start, shot),
                     _ => self.range_mode = RangeMode::PickEnd(shot),
                 },
             }
         }
         Some((view, output.state.offset.y, output.content_size.y, row_pitch))
+    }
+
+    /// The range's two ends are chosen: show just those. Photos outside it leave the
+    /// selection, so nothing off-screen gets picked or deleted.
+    fn finish_range(&mut self, a: usize, b: usize) {
+        let (from, to) = (a.min(b), a.max(b));
+        self.range = Some((from, to));
+        self.range_mode = RangeMode::Off;
+        self.selected.retain(|s| (from..=to).contains(s));
     }
 
     fn range_banner(&mut self, ui: &mut Ui) {
@@ -1814,8 +1809,8 @@ impl App {
         if self.picked.contains(&shot) && self.zoom.is_none() {
             let painter = ui.painter();
             let s = &self.shots[shot];
-            // Which of this shot's files Export on Pick copies, e.g. "JPG + CR3".
-            let copied = self
+            // Which of this shot's files Export on Pick uses, e.g. "JPG + CR3".
+            let files = self
                 .settings
                 .export_files
                 .pick(s.image.as_ref(), s.raw.as_ref())
@@ -1823,7 +1818,7 @@ impl App {
                 .map(|f| if Some(f) == s.raw.as_ref() { s.raw_kind() } else { s.image_kind() })
                 .collect::<Vec<_>>()
                 .join(" + ");
-            let text = if self.settings.export_on_pick { format!("Picked · {copied} copied") } else { "Picked".to_string() };
+            let text = if self.settings.export_on_pick { format!("Picked · {files}") } else { "Picked".to_string() };
             let g = painter.layout_no_wrap(text, theme::font(13.0), Color32::WHITE);
             let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 20.0), g.size() + vec2(44.0, 14.0));
             painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
@@ -1849,15 +1844,19 @@ impl App {
         let max = [(area.width() * ppp).max(800.0) as u32, (area.height() * ppp).max(600.0) as u32];
         let set = self.working_set();
         let pos = set.binary_search(&shot).unwrap_or_else(|i| i) as isize;
-        {
-            for i in [pos, pos + 1, pos - 1, pos + 2] {
-                let Some(&s) = usize::try_from(i).ok().and_then(|i| set.get(i)) else { continue };
-                let s = if i == pos { shot } else { s };
-                let key = Key { shot: s, kind: Kind::Full };
-                if let Some(path) = self.shots[s].display_path() {
-                    if !self.fulls.contains_key(&s) && !self.failed.contains_key(&key) {
-                        requests.push(Request { key, path: path.clone(), max });
-                    }
+        // A loaded photo needs reloading if the window has grown well past its size.
+        let too_small = |f: &FullImage| {
+            let scale = (max[0] as f32 / f.original.x).min(max[1] as f32 / f.original.y).min(1.0);
+            f.tex.size_vec2().x < f.original.x * scale * 0.8
+        };
+        for i in [pos, pos + 1, pos - 1, pos + 2] {
+            // The shown photo always loads, even if it just left the set (e.g. unpicked).
+            let s = if i == pos { Some(shot) } else { usize::try_from(i).ok().and_then(|i| set.get(i)).copied() };
+            let Some(s) = s else { continue };
+            let key = Key { shot: s, kind: Kind::Full };
+            if let Some(path) = self.shots[s].display_path() {
+                if self.fulls.get(&s).map_or(true, too_small) && !self.failed.contains_key(&key) {
+                    requests.push(Request { key, path: path.clone(), max });
                 }
             }
         }
@@ -1973,7 +1972,7 @@ impl App {
         if k.open {
             self.choose_folder(ctx);
         }
-        if k.export && self.folder.is_some() {
+        if k.export && self.folder.is_some() && self.range_mode == RangeMode::Off {
             self.quick_export();
         }
         if k.delete && self.folder.is_some() && self.range_mode == RangeMode::Off {
@@ -2065,24 +2064,13 @@ impl App {
         painter.rect_filled(screen, 0, Color32::from_black_alpha(150));
         painter.rect_stroke(screen.shrink(3.0), p.r_card.min(8), Stroke::new(2.0_f32, p.accent), StrokeKind::Inside);
 
-        let title_g = painter.layout_no_wrap(title, theme::font_semibold(16.0), p.label);
-        let detail_g = detail.map(|d| painter.layout_no_wrap(d, theme::font(13.0), p.label2));
-        let width = title_g.size().x.max(detail_g.as_ref().map_or(0.0, |g| g.size().x)) + 56.0;
-        let height = 26.0 + title_g.size().y + detail_g.as_ref().map_or(0.0, |g| g.size().y + 6.0) + 26.0;
-        let card = Rect::from_center_size(screen.center(), vec2(width, height));
-        let r = theme::around(p.r_card, 2);
-        painter.rect_filled(card, r, p.card);
-        painter.rect_stroke(card, r, Stroke::new(1.0_f32, p.accent), StrokeKind::Inside);
-        let mut y = card.min.y + 26.0;
-        painter.galley(pos2(card.center().x - title_g.size().x / 2.0, y), title_g.clone(), p.label);
-        y += title_g.size().y + 6.0;
-        if let Some(g) = detail_g {
-            painter.galley(pos2(card.center().x - g.size().x / 2.0, y), g, p.label2);
-        }
+        let mut lines = vec![painter.layout_no_wrap(title, theme::font_semibold(16.0), p.label)];
+        lines.extend(detail.map(|d| painter.layout_no_wrap(d, theme::font(13.0), p.label2)));
+        center_card(&painter, screen.center(), &p, lines, &[6.0], vec2(28.0, 26.0), p.accent);
         ctx.request_repaint();
     }
 
-    /// Settings: a sidebar of pages (Keybinds, Themes) and the chosen page.
+    /// Settings: a sidebar of pages and the chosen page.
     fn settings_window(&mut self, ctx: &egui::Context) {
         let Some(page) = self.settings_page else { return };
         let p = self.p;
@@ -2208,8 +2196,7 @@ fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
     );
 }
 
-/// A card per theme, drawn in that theme's own colors and corner style. Returns the
-/// theme clicked, if any.
+/// The Export on Pick page. Returns anything that needs the app (a folder dialog).
 fn export_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) -> ExportAction {
     let mut action = ExportAction::None;
     ui.horizontal(|ui| {
@@ -2287,6 +2274,8 @@ fn toggle_switch(ui: &mut Ui, p: &Palette, on: bool) -> Response {
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// A card per theme, drawn in that theme's own colors and corner style. Returns the
+/// theme clicked, if any.
 fn themes_page(ui: &mut Ui, p: &Palette, current: ThemeId) -> Option<ThemeId> {
     let mut chosen = None;
     ui.label(RichText::new("Theme").font(theme::font_semibold(13.5)).color(p.label2));
@@ -2410,6 +2399,24 @@ fn codec_help_panel(ui: &mut Ui, p: &Palette, area: Rect, help: &CodecHelp) {
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
+}
+
+/// A card in the middle of the window with centered lines of text: `gaps` between the
+/// lines, `pad` inside the card's edge, and a thin `border`.
+fn center_card(painter: &egui::Painter, center: Pos2, p: &Palette, lines: Vec<Arc<egui::Galley>>, gaps: &[f32], pad: Vec2, border: Color32) {
+    let gap_total: f32 = gaps.iter().take(lines.len().saturating_sub(1)).sum();
+    let width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max) + pad.x * 2.0;
+    let height = lines.iter().map(|g| g.size().y).sum::<f32>() + gap_total + pad.y * 2.0;
+    let card = Rect::from_center_size(center, vec2(width, height));
+    let r = theme::around(p.r_card, 2);
+    painter.rect_filled(card, r, p.card);
+    painter.rect_stroke(card, r, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+    let mut y = card.min.y + pad.y;
+    for (i, g) in lines.into_iter().enumerate() {
+        let h = g.size().y;
+        painter.galley(pos2(card.center().x - g.size().x / 2.0, y), g, p.label);
+        y += h + gaps.get(i).copied().unwrap_or(0.0);
+    }
 }
 
 /// The drag-out overlay's text: (title, how many photos, which files go).
@@ -2938,6 +2945,52 @@ mod tests {
         h.app.settings.drag_files = DragFiles::Raw;
         assert_eq!(h.app.drag_paths(&[4]), vec![dir.join("IMG_0004.JPG")]);
         cleanup(&dir);
+    }
+
+    /// Leaving the viewer selects the photo only if it's still on the grid: after
+    /// deleting the last photo, or unpicking it in View Picked, nothing is selected.
+    #[test]
+    fn leaving_the_viewer_never_selects_a_missing_photo() {
+        let mut h = Harness::new();
+        h.app.open_viewer(3);
+        h.app.back_to_grid();
+        assert_eq!(h.app.selected, [3].into_iter().collect());
+
+        h.app.open_viewer(3);
+        h.app.view_picked = true;
+        h.app.back_to_grid();
+        assert!(h.app.selected.is_empty() && h.app.select_anchor.is_none());
+
+        h.app.view_picked = false;
+        h.app.open_viewer(0);
+        h.app.shots.clear();
+        h.app.back_to_grid();
+        assert!(h.app.selected.is_empty());
+        h.frame(vec![], 0.016);
+    }
+
+    /// Opening another folder drops everything that referred to the last one,
+    /// including a delete confirmation (its photo numbers would point at new photos).
+    #[test]
+    fn a_new_folder_clears_the_old_view() {
+        let mut h = Harness::new();
+        h.app.confirm_delete = Some(vec![1, 2]);
+        h.app.view_picked = true;
+        h.app.selected = [4].into_iter().collect();
+        h.app.reset_view();
+        assert!(h.app.confirm_delete.is_none() && !h.app.view_picked && h.app.selected.is_empty());
+        assert_eq!(h.app.pending_scroll, Some(0.0));
+    }
+
+    /// Choosing a range drops selected photos outside it, so they can't be acted on
+    /// while hidden.
+    #[test]
+    fn a_range_keeps_only_the_selection_inside_it() {
+        let mut h = Harness::new();
+        h.app.selected = [2, 10, 40].into_iter().collect();
+        h.app.finish_range(20, 5);
+        assert_eq!(h.app.range, Some((5, 20)));
+        assert_eq!(h.app.selected, [10].into_iter().collect());
     }
 
     /// Pressing on a photo and moving starts a drag of it (selecting it, like

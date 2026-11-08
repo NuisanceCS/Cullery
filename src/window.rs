@@ -51,9 +51,9 @@ pub fn set_icons(hwnd: isize) {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON,
+        LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON,
         SM_CXSMICON, WM_SETICON,
     };
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
@@ -61,9 +61,9 @@ pub fn set_icons(hwnd: isize) {
     // it to our own window; Windows keeps the icons for the life of the process.
     unsafe {
         let Ok(module) = GetModuleHandleW(None) else { return };
-        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let dpi = GetDpiForWindow(hwnd).max(96);
         for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
-            let size = GetSystemMetrics(metric) * dpi / 96;
+            let size = GetSystemMetricsForDpi(metric, dpi);
             // MAKEINTRESOURCE(1)
             let name = PCWSTR(1 as *const u16);
             if let Ok(icon) = LoadImageW(Some(module.into()), name, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) {

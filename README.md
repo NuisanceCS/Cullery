@@ -29,7 +29,8 @@ The built app is `target\release\cullery.exe`.
   a little stack of the photos (with the count) follows the cursor.
 - **Delete** (trash button, or the `Delete` key): asks first, then deletes the selected
   photos (or the one in the viewer) with their RAW files — to the Recycle Bin, or
-  permanently from a memory card (which has no Recycle Bin; the dialog says so).
+  permanently from a memory card or network drive (which have no Recycle Bin; the dialog
+  says so).
   Export-folder copies are kept.
 - **Themes** (Settings → Themes): Apple, Windows 11 (with the Mica wallpaper-tinted top bar,
   on Windows 11 22H2+) and Windows 10, each in dark and light.

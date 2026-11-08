@@ -41,12 +41,13 @@ public static class CulleryIcon {
         int outer = cx;
         for (int x = w - 1; x > cx; x--) { if (px[cy * d.Stride + x * 4 + 3] > 128) { outer = x - cx; break; } }
         // Its dark outline: walk inward while pixels are dark.
-        int ring = outer;
-        while (ring > 0) {
+        int ring = outer, limit = Math.Max(0, outer - 40);
+        while (ring > limit) {
             int i = cy * d.Stride + (cx + ring) * 4;
             if (Math.Max(px[i], Math.Max(px[i + 1], px[i + 2])) > 80) break;
             ring--;
         }
+        if (ring == limit) ring = outer; // artwork that's dark right up to its edge
         double inner = ring + 0.5;
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {

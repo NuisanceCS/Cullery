@@ -1,0 +1,4 @@
+# Builds the Visual C++ runtime into cullery.exe, so it runs on PCs without the
+# Visual C++ Redistributable installed.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

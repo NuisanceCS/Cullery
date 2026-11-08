@@ -264,6 +264,11 @@ impl Settings {
         }
     }
 
+    /// The thumbnail size differs from what was last saved.
+    pub fn tile_width_changed(&self) -> bool {
+        self.tile_width != self.saved.tile_width
+    }
+
     pub fn add_recent(&mut self, dir: PathBuf) {
         self.recent.retain(|d| d != &dir);
         self.recent.insert(0, dir);

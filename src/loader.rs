@@ -1,6 +1,6 @@
 //! Decodes JPGs on background threads so scrolling never waits on the disk.
 //!
-//! Three sizes per shot:
+//! Four sizes per shot:
 //! - `Preview`: the tiny thumbnail the camera stores inside the JPG. Only the first
 //!   few KB of the file are read, so it shows almost instantly, even from an SD card.
 //! - `Thumb`: a sharp grid thumbnail decoded from the full JPG at reduced scale.
@@ -20,7 +20,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
-use image::{imageops, RgbImage, RgbaImage};
+use image::{imageops, ImageBuffer, Pixel, RgbImage, RgbaImage};
 
 use crate::raw;
 
@@ -182,27 +182,7 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
                 q = cvar.wait(q).unwrap();
             }
         };
-        let ext = request.path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-        let kind = request.key.kind;
-        let mut animation = Vec::new();
-        let image = if raw::is_raw_extension(&ext) {
-            decode_raw(&request.path, kind, request.max)
-        } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) || WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
-            match kind {
-                // No embedded thumbnail to grab quickly; the Thumb request decodes it.
-                Kind::Preview => Err("no embedded thumbnail".to_string()),
-                Kind::Full if ext == "gif" => decode_gif_animation(&request.path, request.max).map(|(first, frames)| {
-                    animation = frames;
-                    first
-                }),
-                _ if WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) => decode_with_windows(&request.path, request.max),
-                _ => decode_with_image_crate(&request.path, request.max),
-            }
-        } else if kind == Kind::Preview {
-            decode_embedded_thumbnail(&request.path)
-        } else {
-            decode_file(&request.path, request.max)
-        };
+        let (image, animation) = decode(&request.path, request.key.kind, request.max);
         if tx.send(Loaded { key: request.key, generation, image, animation }).is_err() {
             return;
         }
@@ -210,19 +190,43 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
     }
 }
 
+/// Decodes one file at the size `kind` asks for, picking the decoder by file type. A
+/// decoder that panics on a damaged file counts as a failed load, so it can't take the
+/// worker thread down with it.
+fn decode(path: &Path, kind: Kind, max: [u32; 2]) -> (Result<(ColorImage, [u32; 2]), String>, Vec<(ColorImage, f64)>) {
+    std::panic::catch_unwind(|| {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let mut animation = Vec::new();
+        let image = if raw::is_raw_extension(&ext) {
+            decode_raw(path, kind, max)
+        } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) || WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
+            match kind {
+                // No embedded thumbnail to grab quickly; the Thumb request decodes it.
+                Kind::Preview => Err("no embedded thumbnail".to_string()),
+                Kind::Full if ext == "gif" => decode_gif_animation(path, max).map(|(first, frames)| {
+                    animation = frames;
+                    first
+                }),
+                _ if WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) => decode_with_windows(path, max),
+                _ => decode_with_image_crate(path, max),
+            }
+        } else if kind == Kind::Preview {
+            decode_embedded_thumbnail(path)
+        } else {
+            decode_file(path, max)
+        };
+        (image, animation)
+    })
+    .unwrap_or_else(|_| (Err("the file looks damaged".to_string()), Vec::new()))
+}
+
 /// A small picture of a photo, made quickly for the drag-out stack: the camera's
 /// embedded thumbnail where there is one (a few KB read), with black bars trimmed.
 pub fn quick_picture(path: &Path, max: [u32; 2]) -> Option<ColorImage> {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-    let image = if raw::is_raw_extension(&ext) {
-        decode_raw(path, Kind::Thumb, max)
-    } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) {
-        decode_with_image_crate(path, max)
-    } else if WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
-        decode_with_windows(path, max)
-    } else {
-        decode_embedded_thumbnail(path).or_else(|_| decode_file(path, max))
-    };
+    // A RAW's smallest preview is too tiny for this; its Thumb is a quick read anyway.
+    let is_raw = path.extension().and_then(|e| e.to_str()).is_some_and(raw::is_raw_extension);
+    let first = if is_raw { Kind::Thumb } else { Kind::Preview };
+    let image = decode(path, first, max).0.or_else(|_| decode(path, Kind::Thumb, max).0);
     image.ok().map(|(img, _)| trim_black_bars(img))
 }
 
@@ -258,7 +262,11 @@ fn trim_black_bars(img: ColorImage) -> ColorImage {
 }
 
 /// Shrinks `img` to fit within `max` (never enlarges).
-fn fit_within(img: RgbaImage, max: [u32; 2]) -> RgbaImage {
+fn fit_within<P>(img: ImageBuffer<P, Vec<P::Subpixel>>, max: [u32; 2]) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: Pixel + 'static,
+    P::Subpixel: 'static,
+{
     let (w, h) = img.dimensions();
     if w <= max[0] && h <= max[1] {
         return img;
@@ -329,7 +337,10 @@ fn decode_gif_animation(path: &Path, max: [u32; 2]) -> Result<((ColorImage, [u32
 }
 
 /// Applies an EXIF orientation (1–8) so the image is upright.
-fn orient(img: RgbaImage, orientation: u32) -> RgbaImage {
+fn orient<P>(img: ImageBuffer<P, Vec<P::Subpixel>>, orientation: u32) -> ImageBuffer<P, Vec<P::Subpixel>>
+where
+    P: Pixel + 'static,
+{
     match orientation {
         2 => imageops::flip_horizontal(&img),
         3 => imageops::rotate180(&img),
@@ -348,11 +359,15 @@ fn decode_file(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), Str
     decode_jpeg(&bytes, max, orientation)
 }
 
-/// Where each RAW file's previews are, so the file is only searched once.
+/// Where each RAW file's previews are, so the file is only searched once. Remembered
+/// with the file's size and time: another card can have a file at the very same path.
 fn raw_previews(path: &Path) -> Result<Arc<raw::Previews>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<raw::Previews>>>> = OnceLock::new();
+    type Stamp = (u64, Option<std::time::SystemTime>);
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Stamp, Arc<raw::Previews>)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    if let Some(found) = cache.lock().unwrap().get(path) {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let stamp = (meta.len(), meta.modified().ok());
+    if let Some((_, found)) = cache.lock().unwrap().get(path).filter(|(s, _)| *s == stamp) {
         return Ok(found.clone());
     }
     let found = Arc::new(raw::find_previews(path).map_err(|e| e.to_string())?);
@@ -360,7 +375,7 @@ fn raw_previews(path: &Path) -> Result<Arc<raw::Previews>, String> {
     if cache.len() > 20_000 {
         cache.clear();
     }
-    cache.insert(path.to_path_buf(), found.clone());
+    cache.insert(path.to_path_buf(), (stamp, found.clone()));
     Ok(found)
 }
 
@@ -453,7 +468,10 @@ fn decode_jpeg(bytes: &[u8], max: [u32; 2], orientation: u32) -> Result<(ColorIm
     let rgb: Vec<u8> = match format {
         PixelFormat::RGB24 => pixels,
         PixelFormat::L8 => pixels.iter().flat_map(|&l| [l, l, l]).collect(),
-        PixelFormat::L16 => pixels.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0]]).collect(),
+        PixelFormat::L16 => pixels
+            .chunks_exact(2)
+            .flat_map(|p| [(u16::from_ne_bytes([p[0], p[1]]) >> 8) as u8; 3])
+            .collect(),
         PixelFormat::CMYK32 => pixels
             .chunks_exact(4)
             .flat_map(|p| {
@@ -462,26 +480,10 @@ fn decode_jpeg(bytes: &[u8], max: [u32; 2], orientation: u32) -> Result<(ColorIm
             })
             .collect(),
     };
-    let mut img = RgbImage::from_raw(w, h, rgb).ok_or("pixel buffer size mismatch")?;
+    let img = RgbImage::from_raw(w, h, rgb).ok_or("pixel buffer size mismatch")?;
 
     // The decoder only scales by 1/2, 1/4 or 1/8; finish the job.
-    if w > max_w || h > max_h {
-        let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
-        let nw = ((w as f32 * scale).round() as u32).max(1);
-        let nh = ((h as f32 * scale).round() as u32).max(1);
-        img = imageops::resize(&img, nw, nh, imageops::FilterType::Triangle);
-    }
-
-    let img = match orientation {
-        2 => imageops::flip_horizontal(&img),
-        3 => imageops::rotate180(&img),
-        4 => imageops::flip_vertical(&img),
-        5 => imageops::flip_horizontal(&imageops::rotate90(&img)),
-        6 => imageops::rotate90(&img),
-        7 => imageops::flip_horizontal(&imageops::rotate270(&img)),
-        8 => imageops::rotate270(&img),
-        _ => img,
-    };
+    let img = orient(fit_within(img, [max_w, max_h]), orientation);
     let size = [img.width() as usize, img.height() as usize];
     Ok((ColorImage::from_rgb(size, img.as_raw()), original))
 }

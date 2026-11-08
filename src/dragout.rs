@@ -201,27 +201,14 @@ impl Drop for ImageCover {
 fn set_drag_image(data: &windows::Win32::System::Com::IDataObject, image: &DragImage) -> windows::core::Result<()> {
     use windows::core::Interface;
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
-    use windows::Win32::Graphics::Gdi::{
-        CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    };
+    use windows::Win32::Graphics::Gdi::{CreateDIBSection, DeleteObject, DIB_RGB_COLORS};
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::{
         CLSID_DragDropHelper, IDragSourceHelper, IDragSourceHelper2, DSH_ALLOWDROPDESCRIPTIONTEXT, SHDRAGIMAGE,
     };
 
     let [w, h] = [image.size[0] as i32, image.size[1] as i32];
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h, // top row first
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let info = crate::dragimage::bitmap_info(w, h);
     // SAFETY: the bitmap's pixel buffer is exactly w*h*4 bytes, filled from `image`
     // (same size). On success the drag helper owns the bitmap; otherwise it's freed here.
     unsafe {
