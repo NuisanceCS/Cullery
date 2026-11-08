@@ -33,6 +33,19 @@ pub struct Settings {
     pub tile_width: f32,
     pub drag_files: DragFiles,
     pub theme: ThemeId,
+    /// The values as last loaded or saved by this window, to tell which ones it changed.
+    saved: Snapshot,
+}
+
+/// A copy of the saved values.
+#[derive(Clone, PartialEq, Debug)]
+struct Snapshot {
+    export_dir: Option<PathBuf>,
+    recent: Vec<PathBuf>,
+    show_raw: bool,
+    tile_width: f32,
+    drag_files: DragFiles,
+    theme: ThemeId,
 }
 
 /// Which of a shot's files go along when photos are dragged out of Cullery.
@@ -75,14 +88,15 @@ impl DragFiles {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
+        let saved = Snapshot {
             export_dir: None,
             recent: Vec::new(),
             show_raw: false,
             tile_width: 190.0,
             drag_files: DragFiles::Raw,
             theme: ThemeId::AppleDark,
-        }
+        };
+        Self::from_snapshot(saved)
     }
 }
 
@@ -91,11 +105,39 @@ fn file() -> Option<PathBuf> {
 }
 
 impl Settings {
+    fn from_snapshot(s: Snapshot) -> Self {
+        Self {
+            export_dir: s.export_dir.clone(),
+            recent: s.recent.clone(),
+            show_raw: s.show_raw,
+            tile_width: s.tile_width,
+            drag_files: s.drag_files,
+            theme: s.theme,
+            saved: s,
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            export_dir: self.export_dir.clone(),
+            recent: self.recent.clone(),
+            show_raw: self.show_raw,
+            tile_width: self.tile_width,
+            drag_files: self.drag_files,
+            theme: self.theme,
+        }
+    }
+
     pub fn load() -> Self {
+        file().map(|f| Self::load_from(&f)).unwrap_or_default()
+    }
+
+    fn load_from(path: &std::path::Path) -> Self {
+        Self::parse(&std::fs::read_to_string(path).unwrap_or_default())
+    }
+
+    fn parse(text: &str) -> Self {
         let mut s = Self::default();
-        let Some(text) = file().and_then(|f| std::fs::read_to_string(f).ok()) else {
-            return s;
-        };
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
             match key {
@@ -121,31 +163,108 @@ impl Settings {
             }
         }
         s.recent.truncate(MAX_RECENT);
+        s.saved = s.snapshot();
         s
     }
 
-    pub fn save(&self) {
-        let Some(path) = file() else { return };
+    pub fn save(&mut self) {
+        if let Some(path) = file() {
+            self.save_to(&path);
+        }
+    }
+
+    /// Writes only the settings this window changed, on top of what's in the file now.
+    /// Another Cullery window (or an older version) may have saved in the meantime;
+    /// writing this window's whole stale copy would undo its changes — e.g. put the
+    /// theme back to the default.
+    fn save_to(&mut self, path: &std::path::Path) {
+        let mut merged = Self::load_from(path).snapshot();
+        let mine = self.snapshot();
+        let base = &self.saved;
+        if mine.export_dir != base.export_dir {
+            merged.export_dir = mine.export_dir.clone();
+        }
+        if mine.recent != base.recent {
+            merged.recent = mine.recent.clone();
+        }
+        if mine.show_raw != base.show_raw {
+            merged.show_raw = mine.show_raw;
+        }
+        if mine.tile_width != base.tile_width {
+            merged.tile_width = mine.tile_width;
+        }
+        if mine.drag_files != base.drag_files {
+            merged.drag_files = mine.drag_files;
+        }
+        if mine.theme != base.theme {
+            merged.theme = mine.theme;
+        }
+
         let mut text = String::new();
-        if let Some(dir) = &self.export_dir {
+        if let Some(dir) = &merged.export_dir {
             text += &format!("export={}\n", dir.display());
         }
-        for dir in &self.recent {
+        for dir in &merged.recent {
             text += &format!("recent={}\n", dir.display());
         }
-        text += &format!("show_raw={}\n", if self.show_raw { 1 } else { 0 });
-        text += &format!("tile_width={}\n", self.tile_width.round());
-        text += &format!("drag_files={}\n", self.drag_files.key());
-        text += &format!("theme={}\n", self.theme.key());
+        text += &format!("show_raw={}\n", if merged.show_raw { 1 } else { 0 });
+        text += &format!("tile_width={}\n", merged.tile_width.round());
+        text += &format!("drag_files={}\n", merged.drag_files.key());
+        text += &format!("theme={}\n", merged.theme.key());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, text);
+        if std::fs::write(path, text).is_ok() {
+            self.saved = mine;
+        }
     }
 
     pub fn add_recent(&mut self, dir: PathBuf) {
         self.recent.retain(|d| d != &dir);
         self.recent.insert(0, dir);
         self.recent.truncate(MAX_RECENT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two windows open at once: one picks a theme, the other later changes something
+    /// else. The theme must survive.
+    #[test]
+    fn saving_keeps_other_windows_changes() {
+        let path = std::env::temp_dir().join(format!("cullery-settings-test-{}.txt", std::process::id()));
+        std::fs::write(&path, "theme=apple-dark\ntile_width=190\n").unwrap();
+
+        let mut a = Settings::load_from(&path);
+        let mut b = Settings::load_from(&path);
+        a.theme = ThemeId::Win11Dark;
+        a.save_to(&path);
+        b.tile_width = 270.0;
+        b.save_to(&path);
+
+        let after = Settings::load_from(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(after.theme, ThemeId::Win11Dark);
+        assert_eq!(after.tile_width, 270.0);
+    }
+
+    /// Every setting round-trips through the file.
+    #[test]
+    fn settings_round_trip() {
+        let path = std::env::temp_dir().join(format!("cullery-settings-rt-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Settings::load_from(&path);
+        s.export_dir = Some(PathBuf::from(r"D:\Selects"));
+        s.add_recent(PathBuf::from(r"F:\DCIM\100CANON"));
+        s.show_raw = true;
+        s.tile_width = 240.0;
+        s.drag_files = DragFiles::Both;
+        s.theme = ThemeId::Win10Light;
+        s.save_to(&path);
+        let back = Settings::load_from(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(back.snapshot(), s.snapshot());
     }
 }

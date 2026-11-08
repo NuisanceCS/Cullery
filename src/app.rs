@@ -698,7 +698,7 @@ impl App {
                         // Right-to-left: the cog lands just left of "Export to".
                         let open = self.settings_page.is_some();
                         if cog_button(ui, &p, open).on_hover_text("Settings").clicked() {
-                            self.settings_page = if open { None } else { Some(SettingsPage::Keybinds) };
+                            self.settings_page = if open { None } else { Some(SettingsPage::DragDrop) };
                         }
                     });
                 });
@@ -1759,8 +1759,8 @@ impl App {
                         ui.set_width(SIDEBAR_W);
                         ui.set_min_height(PAGE.y);
                         let pages = [
-                            (SettingsPage::Keybinds, "Keybinds"),
                             (SettingsPage::DragDrop, "Drag & Drop"),
+                            (SettingsPage::Keybinds, "Keybinds"),
                             (SettingsPage::Themes, "Themes"),
                         ];
                         for (target, label) in pages {
