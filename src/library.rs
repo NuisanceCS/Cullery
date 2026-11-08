@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::raw;
+
 const JPG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
-const RAW_EXTENSIONS: &[&str] = &["cr3", "cr2"];
 
 /// One shot: a JPG, a RAW, or both.
 #[derive(Clone, Debug)]
@@ -29,7 +30,21 @@ impl Shot {
     }
 
     pub fn raw_name(&self) -> String {
-        file_name(self.raw.as_deref()).unwrap_or_else(|| format!("{}.CR3", self.name))
+        file_name(self.raw.as_deref()).unwrap_or_else(|| format!("{}.RAW", self.name))
+    }
+
+    /// The RAW file's type in capitals, e.g. "CR3".
+    pub fn raw_kind(&self) -> String {
+        self.raw
+            .as_deref()
+            .and_then(|p| p.extension())
+            .map(|e| e.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| "RAW".into())
+    }
+
+    /// The file to show: the JPG, or for RAW-only shots, the RAW's embedded preview.
+    pub fn display_path(&self) -> Option<&PathBuf> {
+        self.jpg.as_ref().or(self.raw.as_ref())
     }
 }
 
@@ -58,7 +73,7 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
         }
         let ext = ext.to_ascii_lowercase();
         let is_jpg = JPG_EXTENSIONS.contains(&ext.as_str());
-        let is_raw = RAW_EXTENSIONS.contains(&ext.as_str());
+        let is_raw = raw::is_raw_extension(&ext);
         if !is_jpg && !is_raw {
             continue;
         }
@@ -92,6 +107,7 @@ mod tests {
             "img_0001.cr3",
             "IMG_0003.CR3",
             "IMG_0004.JPG",
+            "DSC_0005.NEF",
             "notes.txt",
             "._IMG_0002.JPG",
         ] {
@@ -108,6 +124,7 @@ mod tests {
         assert_eq!(
             summary,
             vec![
+                ("DSC_0005".into(), false, true),
                 ("IMG_0001".into(), true, true),
                 ("IMG_0002".into(), true, true),
                 ("IMG_0003".into(), false, true),

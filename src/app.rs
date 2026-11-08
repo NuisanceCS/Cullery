@@ -220,7 +220,7 @@ impl App {
                 self.view_anchor = None;
                 self.reset_zoom();
                 self.message = if self.shots.is_empty() {
-                    Some(("No JPG or CR3 files in this folder".into(), false))
+                    Some(("No JPG or RAW files in this folder".into(), false))
                 } else {
                     None
                 };
@@ -535,7 +535,7 @@ impl App {
         let mut previews = Vec::new();
         let mut sharp = Vec::new();
         for (i, &shot) in visible.iter().chain(ahead).enumerate() {
-            let Some(path) = &self.shots[shot].jpg else { continue };
+            let Some(path) = self.shots[shot].display_path() else { continue };
             let have = self.thumbs.get(&shot).map(|t| t.kind);
             let is_visible = i < visible.len();
             let preview = Key { shot, kind: Kind::Preview };
@@ -850,7 +850,7 @@ impl App {
                     ui.add_space(24.0);
                     section_label(ui, &p, "Memory Cards");
                     for card in &cards {
-                        let sub = format!("{} JPG · {} CR3", card.jpgs, card.raws);
+                        let sub = format!("{} JPG · {} RAW", card.jpgs, card.raws);
                         if list_row(ui, &p, &card.path.display().to_string(), Some(&sub), None).clicked() {
                             open = Some(card.path.clone());
                         }
@@ -1096,8 +1096,8 @@ impl App {
             t.last_used = self.frame;
             let fit = fit_rect(thumb_rect, t.tex.size_vec2());
             Image::new((t.tex.id(), fit.size())).corner_radius(4).paint_at(ui, fit);
-        } else if shot.jpg.is_none() {
-            painter.text(thumb_rect.center(), Align2::CENTER_CENTER, "RAW only", theme::font(12.0), p.label2);
+        } else if self.failed.contains(&Key { shot: item.shot, kind: Kind::Thumb }) {
+            painter.text(thumb_rect.center(), Align2::CENTER_CENTER, "No preview", theme::font(12.0), p.label2);
         }
         let hovered = resp.hovered() || circle.as_ref().is_some_and(|c| c.hovered());
         if resp.hovered() {
@@ -1151,10 +1151,10 @@ impl App {
         }
         painter.galley(name_rect.min + vec2(6.0, 1.0), g, name_color);
         let sub = match (item.raw, shot.jpg.is_some(), shot.raw.is_some()) {
-            (true, true, _) => "Paired with JPG",
-            (true, false, _) => "No JPG",
-            (false, _, true) => "+ CR3",
-            (false, _, false) => "No RAW",
+            (true, true, _) => "Paired with JPG".to_string(),
+            (true, false, _) => "No JPG".to_string(),
+            (false, _, true) => format!("+ {}", shot.raw_kind()),
+            (false, _, false) => "No RAW".to_string(),
         };
         painter.text(pos2(thumb_rect.center().x, name_rect.max.y + 8.0), Align2::CENTER_CENTER, sub, theme::font(11.0), p.label2);
 
@@ -1257,7 +1257,8 @@ impl App {
                     let fit = fit_rect(area, t.tex.size_vec2());
                     Image::new((t.tex.id(), fit.size())).corner_radius(4).paint_at(ui, fit);
                 } else {
-                    let text = if self.shots[shot].jpg.is_none() { "RAW only — no preview yet" } else { "Loading…" };
+                    let failed = self.failed.contains(&Key { shot, kind: Kind::Full });
+                    let text = if failed { "No preview found in this file" } else { "Loading…" };
                     ui.painter().text(area.center(), Align2::CENTER_CENTER, text, theme::font(14.0), p.label2);
                 }
             }
@@ -1265,7 +1266,13 @@ impl App {
 
         if self.picked.contains(&shot) && self.zoom.is_none() {
             let painter = ui.painter();
-            let g = painter.layout_no_wrap("Picked · JPG + CR3 copied".into(), theme::font(13.0), Color32::WHITE);
+            let s = &self.shots[shot];
+            let copied = match (s.jpg.is_some(), s.raw.is_some()) {
+                (true, true) => format!("JPG + {}", s.raw_kind()),
+                (true, false) => "JPG".to_string(),
+                _ => s.raw_kind(),
+            };
+            let g = painter.layout_no_wrap(format!("Picked · {copied} copied"), theme::font(13.0), Color32::WHITE);
             let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 20.0), g.size() + vec2(44.0, 14.0));
             painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
             let c = pos2(r.min.x + 17.0, r.center().y);
@@ -1281,7 +1288,7 @@ impl App {
             let have = self.original.as_ref().is_some_and(|(s, _)| *s == shot);
             let key = Key { shot, kind: Kind::Original };
             if zoom * ppp * orig.x > full_w * 1.05 && !have && !self.failed.contains(&key) {
-                if let Some(path) = &self.shots[shot].jpg {
+                if let Some(path) = self.shots[shot].display_path() {
                     let side = ui.input(|i| i.max_texture_side) as u32;
                     requests.push(Request { key, path: path.clone(), max: [side, side] });
                 }
@@ -1295,7 +1302,7 @@ impl App {
                 }
                 let s = s as usize;
                 let key = Key { shot: s, kind: Kind::Full };
-                if let Some(path) = &self.shots[s].jpg {
+                if let Some(path) = self.shots[s].display_path() {
                     if !self.fulls.contains_key(&s) && !self.failed.contains(&key) {
                         requests.push(Request { key, path: path.clone(), max });
                     }

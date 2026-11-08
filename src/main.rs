@@ -7,6 +7,7 @@ mod export;
 mod library;
 mod loader;
 mod picks;
+mod raw;
 mod settings;
 mod theme;
 

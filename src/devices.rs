@@ -54,10 +54,11 @@ fn scan() -> Vec<CardFolder> {
             let (mut jpgs, mut raws) = (0, 0);
             if let Ok(files) = std::fs::read_dir(&path) {
                 for f in files.filter_map(|e| e.ok()) {
-                    let name = f.file_name().to_string_lossy().to_ascii_lowercase();
-                    if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+                    let path = f.path();
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+                    if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
                         jpgs += 1;
-                    } else if name.ends_with(".cr3") || name.ends_with(".cr2") {
+                    } else if crate::raw::is_raw_extension(ext) {
                         raws += 1;
                     }
                 }

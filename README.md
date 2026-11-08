@@ -31,6 +31,15 @@ The built app is `target\release\cullery.exe`.
   `%APPDATA%\Cullery\picks\`.
 
 JPG and RAW are paired by file name (`IMG_4821.JPG` + `IMG_4821.CR3`).
+Shots with only a RAW are shown using the JPEG previews the camera embeds in the file
+(no RAW processing): CR3 (thumbnail, 1620×1080 and full size), TIFF-based RAWs (CR2, NEF,
+ARW, DNG, ORF, RW2, PEF, SRW) and Fujifilm RAF.
+
+To check the RAW reader against real files:
+
+```
+$env:CULLERY_RAW_SAMPLES='F:\DCIM\100CANON'; cargo test --release raw -- --nocapture
+```
 Settings live in `%APPDATA%\Cullery\settings.txt`.
 
 ## Test photos

@@ -7,17 +7,22 @@
 //! - `Full`: the image sized to the viewer.
 //! - `Original`: every pixel, for zooming in.
 //!
+//! RAW files (shots with no JPG) use the JPEGs the camera embedded in them instead;
+//! see `raw.rs`.
+//!
 //! The UI tells the loader each frame what it wants, in priority order; anything
 //! scrolled past is dropped from the queue instead of piling up.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
 use image::{imageops, RgbImage};
+
+use crate::raw;
 
 /// Long edge of grid thumbnails, in pixels.
 pub const THUMB_PX: u32 = 400;
@@ -165,9 +170,11 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
                 q = cvar.wait(q).unwrap();
             }
         };
-        let image = match request.key.kind {
-            Kind::Preview => decode_embedded_thumbnail(&request.path),
-            Kind::Thumb | Kind::Full | Kind::Original => decode_file(&request.path, request.max),
+        let is_raw = request.path.extension().and_then(|e| e.to_str()).is_some_and(raw::is_raw_extension);
+        let image = match (is_raw, request.key.kind) {
+            (true, kind) => decode_raw(&request.path, kind, request.max),
+            (false, Kind::Preview) => decode_embedded_thumbnail(&request.path),
+            (false, _) => decode_file(&request.path, request.max),
         };
         if tx.send(Loaded { key: request.key, generation, image }).is_err() {
             return;
@@ -178,8 +185,49 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
 
 fn decode_file(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let orientation = exif_orientation(&bytes);
+    let orientation = exif_orientation(&bytes).unwrap_or(1);
     decode_jpeg(&bytes, max, orientation)
+}
+
+/// Where each RAW file's previews are, so the file is only searched once.
+fn raw_previews(path: &Path) -> Result<Arc<raw::Previews>, String> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<raw::Previews>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(found) = cache.lock().unwrap().get(path) {
+        return Ok(found.clone());
+    }
+    let found = Arc::new(raw::find_previews(path).map_err(|e| e.to_string())?);
+    let mut cache = cache.lock().unwrap();
+    if cache.len() > 20_000 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), found.clone());
+    Ok(found)
+}
+
+/// Shows a RAW file using the JPEG the camera embedded in it: the smallest one
+/// that's big enough for what's being drawn.
+fn decode_raw(path: &Path, kind: Kind, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    let previews = raw_previews(path)?;
+    let choice = match kind {
+        Kind::Preview => previews.smallest(),
+        Kind::Thumb => previews.at_least([THUMB_PX, THUMB_PX]),
+        Kind::Full => previews.at_least(max),
+        Kind::Original => previews.largest(),
+    }
+    .ok_or("no embedded preview")?;
+    let bytes = raw::read_preview(path, choice).map_err(|e| e.to_string())?;
+    // The JPEG's own orientation if it has one, else the RAW's.
+    let orientation = exif_orientation(&bytes).or(previews.orientation).unwrap_or(1);
+    let (image, _) = decode_jpeg(&bytes, max, orientation)?;
+    // Report the photo's size as the biggest preview, so zoom percentages are right.
+    let biggest = previews.largest().unwrap_or(choice);
+    let original = if (5..=8).contains(&orientation) {
+        [biggest.height, biggest.width]
+    } else {
+        [biggest.width, biggest.height]
+    };
+    Ok((image, original))
 }
 
 /// The small JPEG thumbnail cameras store in the EXIF block at the start of the file.
@@ -213,7 +261,7 @@ fn decode_embedded_thumbnail(path: &Path) -> Result<(ColorImage, [u32; 2]), Stri
     decode_jpeg(thumb, [THUMB_PX, THUMB_PX], orientation)
 }
 
-fn exif_orientation(jpeg: &[u8]) -> u32 {
+fn exif_orientation(jpeg: &[u8]) -> Option<u32> {
     exif::Reader::new()
         .read_from_container(&mut Cursor::new(jpeg))
         .ok()
@@ -221,7 +269,6 @@ fn exif_orientation(jpeg: &[u8]) -> u32 {
             e.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
                 .and_then(|f| f.value.get_uint(0))
         })
-        .unwrap_or(1)
 }
 
 /// Decodes a JPEG no larger than `max` (after rotation), using the decoder's
@@ -283,6 +330,32 @@ fn decode_jpeg(bytes: &[u8], max: [u32; 2], orientation: u32) -> Result<(ColorIm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decodes real RAW files' embedded previews at each size, e.g.
+    /// `$env:CULLERY_RAW_SAMPLES='F:\DCIM\100CANON'; cargo test --release raw_decode -- --nocapture`
+    #[test]
+    fn raw_decode_samples() {
+        let Some(dir) = std::env::var_os("CULLERY_RAW_SAMPLES") else { return };
+        let files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(raw::is_raw_extension))
+            .take(3)
+            .collect();
+        for path in files {
+            for (kind, max) in [(Kind::Preview, [THUMB_PX; 2]), (Kind::Thumb, [THUMB_PX; 2]), (Kind::Full, [2560, 1440]), (Kind::Original, [16384; 2])] {
+                let start = std::time::Instant::now();
+                let (img, original) = decode_raw(&path, kind, max).unwrap();
+                println!(
+                    "{} {kind:?}: {:?} of {:?} in {:?}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    img.size,
+                    original,
+                    start.elapsed()
+                );
+            }
+        }
+    }
 
     /// Runs against the sample shots from `tools/make-test-photos.ps1`, if present.
     #[test]
