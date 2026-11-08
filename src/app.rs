@@ -38,6 +38,35 @@ enum Screen {
     Viewer,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsPage {
+    Keybinds,
+    Themes,
+}
+
+/// Shortcuts shown on the Keybinds page: (keys, what they do).
+const GRID_KEYS: &[(&str, &str)] = &[
+    ("Click", "Select a photo"),
+    ("Ctrl + Click", "Add or remove from the selection"),
+    ("Shift + Click", "Select everything from the last clicked photo"),
+    ("Ctrl + A", "Select all"),
+    ("Double-click  /  Enter", "Open the photo"),
+    ("P  /  Space", "Pick the selected photos (again to unpick)"),
+    ("Ctrl + E", "Quick Export the selected photos"),
+    ("Esc", "Clear the selection, or cancel Select Range"),
+    ("Ctrl + O", "Open a folder"),
+];
+const VIEWER_KEYS: &[(&str, &str)] = &[
+    ("←  /  →", "Previous / next photo"),
+    ("Home  /  End", "First / last photo"),
+    ("P  /  Space", "Pick (again to unpick)"),
+    ("Ctrl + E", "Quick Export this photo"),
+    ("Scroll wheel", "Zoom around the cursor"),
+    ("Double-click", "Zoom to that spot, or back to fit"),
+    ("Drag", "Move around while zoomed"),
+    ("Esc", "Back to the grid"),
+];
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum RangeMode {
     Off,
@@ -130,6 +159,8 @@ pub struct App {
     last_tile_click: Option<(usize, f64)>,
     /// Longest gap between the clicks of a double-click, from Windows' setting.
     double_click_time: f64,
+    /// The settings window, and which page it shows.
+    settings_page: Option<SettingsPage>,
 
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
@@ -190,6 +221,7 @@ impl App {
             drawn_tiles: Vec::new(),
             last_tile_click: None,
             double_click_time,
+            settings_page: None,
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
@@ -600,6 +632,11 @@ impl App {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         self.export_button(ui);
+                        // Right-to-left: the cog lands just left of "Export to".
+                        let open = self.settings_page.is_some();
+                        if cog_button(ui, &p, open).on_hover_text("Settings").clicked() {
+                            self.settings_page = if open { None } else { Some(SettingsPage::Keybinds) };
+                        }
                     });
                 });
 
@@ -699,7 +736,7 @@ impl App {
         let p = self.p;
         let mut job = LayoutJob::default();
         job.append("Quick Export", 0.0, TextFormat { font_id: theme::font(13.5), color: p.label, ..Default::default() });
-        job.append("   Ctrl E", 0.0, TextFormat { font_id: theme::font(12.0), color: p.label2, ..Default::default() });
+        job.append("   Ctrl E", 0.0, key_hint(12.0, p.label2));
         let tip = "Copy the selected photos' JPG + RAW to the export folder";
         if ui.add_enabled(enabled, Button::new(job)).on_hover_text(tip).clicked() {
             self.quick_export();
@@ -1389,6 +1426,7 @@ impl App {
             }
         }
 
+        #[derive(Default)]
         struct Keys {
             open: bool,
             export: bool,
@@ -1401,7 +1439,7 @@ impl App {
             home: bool,
             end: bool,
         }
-        let k = ctx.input(|i| Keys {
+        let mut k = ctx.input(|i| Keys {
             open: i.modifiers.command && i.key_pressed(KeyCode::O),
             export: i.modifiers.command && i.key_pressed(KeyCode::E),
             select_all: i.modifiers.command && i.key_pressed(KeyCode::A),
@@ -1413,6 +1451,13 @@ impl App {
             home: i.key_pressed(KeyCode::Home),
             end: i.key_pressed(KeyCode::End),
         });
+        // While Settings is open, keys don't reach the grid or viewer; Esc closes it.
+        if self.settings_page.is_some() {
+            if k.esc {
+                self.settings_page = None;
+            }
+            k = Keys::default();
+        }
         if k.open {
             self.choose_folder(ctx);
         }
@@ -1488,8 +1533,98 @@ impl App {
             }
         });
         self.content_rect = panel.response.rect;
+        self.settings_window(ctx);
         self.draw_toast(ctx);
     }
+
+    /// Settings: a sidebar of pages (Keybinds, Themes) and the chosen page.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let Some(page) = self.settings_page else { return };
+        let p = self.p;
+        let mut open = true;
+        egui::Window::new(RichText::new("Settings").font(theme::font_semibold(15.0)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(vec2(620.0, 430.0))
+            .frame(Frame::window(&ctx.style()).fill(p.card).inner_margin(Margin::same(16)))
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // Sidebar.
+                    ui.vertical(|ui| {
+                        ui.set_width(140.0);
+                        for (target, label) in [(SettingsPage::Keybinds, "Keybinds"), (SettingsPage::Themes, "Themes")] {
+                            let on = page == target;
+                            let b = Button::new(RichText::new(label).color(if on { Color32::WHITE } else { p.label }))
+                                .fill(if on { p.accent } else { Color32::TRANSPARENT })
+                                .stroke(Stroke::NONE)
+                                .corner_radius(theme::RADIUS)
+                                .min_size(vec2(140.0, 32.0));
+                            if ui.add(b).clicked() {
+                                self.settings_page = Some(target);
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| match page {
+                        SettingsPage::Keybinds => keybinds_page(ui, &p),
+                        SettingsPage::Themes => themes_page(ui, &p),
+                    });
+                });
+            });
+        if !open {
+            self.settings_page = None;
+        }
+    }
+}
+
+fn keybinds_page(ui: &mut Ui, p: &Palette) {
+    ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
+        for (title, keys) in [("Grid", GRID_KEYS), ("Viewer", VIEWER_KEYS)] {
+            ui.label(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label2));
+            egui::Grid::new(title).num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
+                for (key, action) in keys {
+                    ui.label(RichText::new(*key).font(theme::font_semibold(13.0)));
+                    ui.label(RichText::new(*action).color(p.label2));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(12.0);
+        }
+        ui.label(RichText::new("Changing keybinds is coming soon.").color(p.label2).italics());
+    });
+}
+
+fn themes_page(ui: &mut Ui, p: &Palette) {
+    ui.label(RichText::new("Theme").font(theme::font_semibold(13.5)).color(p.label2));
+    ui.add_space(4.0);
+    // The one theme so far, shown as selected.
+    Frame::new()
+        .fill(p.bg)
+        .stroke(Stroke::new(2.0_f32, p.accent))
+        .corner_radius(10)
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(220.0);
+            ui.horizontal(|ui| {
+                for c in [p.bar, p.control, p.label2, p.accent] {
+                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 10.0, c);
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Dark (Apple)").font(theme::font_semibold(13.5)));
+            ui.label(RichText::new("Current theme").color(p.label2));
+        });
+    ui.add_space(14.0);
+    ui.label(
+        RichText::new("More themes, including a Windows-style one, and ways to customize them are coming soon.")
+            .color(p.label2)
+            .italics(),
+    );
 }
 
 // -------------------------------------------------------------------- helpers
@@ -1625,13 +1760,40 @@ fn scrollbar(ui: &Ui, p: &Palette, rect: Rect, offset: f32, content_h: f32, view
     ((new - offset).abs() > 0.01).then_some(new)
 }
 
+/// Round icon button with a gear drawn in it, for Settings.
+fn cog_button(ui: &mut Ui, p: &Palette, open: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
+    let painter = ui.painter();
+    if open || resp.hovered() {
+        let fill = if open { p.control } else { Color32::from_white_alpha(14) };
+        painter.rect_filled(rect, theme::RADIUS, fill);
+    }
+    let color = if open || resp.hovered() { p.label } else { p.label2 };
+    let c = rect.center();
+    // Eight teeth, a ring, and a hole.
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::TAU / 8.0;
+        let dir = vec2(a.cos(), a.sin());
+        painter.line_segment([c + dir * 5.5, c + dir * 8.5], Stroke::new(3.0_f32, color));
+    }
+    painter.circle_stroke(c, 5.5, Stroke::new(2.2_f32, color));
+    painter.circle_filled(c, 2.0, color);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Smaller text for a keyboard shortcut next to a button label. Centered on the
+/// label's middle; egui's default lines it up along the bottom, so it sat too low.
+fn key_hint(size: f32, color: Color32) -> TextFormat {
+    TextFormat { font_id: theme::font(size), color, valign: Align::Center, ..Default::default() }
+}
+
 /// The big Pick button (grid and viewer). Filled blue once picked.
 fn pick_button(ui: &mut Ui, p: &Palette, label: &str, picked: bool, enabled: bool) -> Response {
     let (fill, color) = if picked { (p.accent, Color32::WHITE) } else { (p.control, p.tint) };
     let mut job = LayoutJob::default();
     job.append(&format!("✔  {label}"), 0.0, TextFormat { font_id: theme::font_semibold(15.0), color, ..Default::default() });
     let key_color = if picked { Color32::from_white_alpha(170) } else { p.label2 };
-    job.append("   P", 0.0, TextFormat { font_id: theme::font(13.0), color: key_color, ..Default::default() });
+    job.append("   P", 0.0, key_hint(13.0, key_color));
     let button = Button::new(job)
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, if picked { p.accent } else { p.control_border }))
@@ -1857,6 +2019,25 @@ mod tests {
             h.frame(vec![Harness::button(pos, false)], pause);
             assert!(h.double_click(pos, 0.2), "pause {pause}");
         }
+    }
+
+    /// Esc closes Settings and nothing else: the grid selection behind it stays.
+    #[test]
+    fn esc_closes_settings_only() {
+        let mut h = Harness::new();
+        h.app.selected.insert(3);
+        h.app.settings_page = Some(SettingsPage::Themes);
+        h.frame(vec![], 0.016);
+        let esc = Event::Key {
+            key: KeyCode::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        h.frame(vec![esc], 0.016);
+        assert!(h.app.settings_page.is_none());
+        assert!(h.app.selected.contains(&3));
     }
 
     /// Slow clicks, or clicks on two different photos, only select.
