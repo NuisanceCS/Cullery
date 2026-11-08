@@ -170,6 +170,8 @@ pub struct App {
     view_picked: bool,
     /// The app window, for starting drags out of it (None in tests).
     hwnd: Option<isize>,
+    /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
+    last_drag: HashSet<PathBuf>,
 
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
@@ -239,6 +241,7 @@ impl App {
             settings_page: None,
             view_picked: false,
             hwnd: None,
+            last_drag: HashSet::new(),
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
@@ -855,6 +858,7 @@ impl App {
         let mut shots: Vec<usize> = self.selected.iter().copied().collect();
         shots.sort_unstable();
         let paths = self.drag_paths(&shots);
+        self.last_drag = paths.iter().cloned().collect();
         let Some(hwnd) = self.hwnd else { return };
         if let Err(e) = crate::dragout::drag_files(hwnd, &paths) {
             self.error(format!("Couldn't start the drag: {e}"));
@@ -886,6 +890,23 @@ impl App {
             }
         }
         paths
+    }
+
+    /// Something dropped onto the window. The open folder only changes when a folder is
+    /// dropped (or through the buttons): dropped files never switch it. Photos dragged
+    /// out of Cullery that land back on it are ignored.
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if dropped.is_empty() {
+            return;
+        }
+        if dropped.iter().all(|p| self.last_drag.contains(p)) {
+            return;
+        }
+        match dropped.iter().find(|p| p.is_dir()) {
+            Some(dir) => self.open_folder(ctx, dir.clone()),
+            None => self.message = Some(("To open photos, drop their folder onto Cullery".into(), false)),
+        }
     }
 
     fn set_view_picked(&mut self, on: bool) {
@@ -1543,14 +1564,7 @@ impl App {
         self.frame += 1;
         self.receive(ctx);
 
-        // A folder (or a photo inside one) dropped onto the window opens it.
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            let dir = if path.is_dir() { Some(path) } else { path.parent().map(Path::to_path_buf) };
-            if let Some(dir) = dir {
-                self.open_folder(ctx, dir);
-            }
-        }
+        self.handle_drops(ctx);
 
         #[derive(Default)]
         struct Keys {
@@ -2250,6 +2264,43 @@ mod tests {
         // which photos it would carry: the one under the pointer, as it wasn't selected.
         assert_eq!(h.app.selected, [h.app.drawn_tiles[7].0.shot].into_iter().collect());
         assert!(h.app.screen == Screen::Grid);
+    }
+
+    /// Only a dropped folder changes the open folder. Dropped files — including photos
+    /// just dragged out of Cullery landing back on it — leave it alone.
+    #[test]
+    fn dropped_files_never_switch_folders() {
+        use eframe::egui::DroppedFile;
+        let drop = |h: &mut Harness, paths: Vec<PathBuf>| {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(h.time),
+                dropped_files: paths.into_iter().map(|p| DroppedFile { path: Some(p), ..Default::default() }).collect(),
+                ..Default::default()
+            };
+            let app = &mut h.app;
+            let _ = h.ctx.run(input, |ctx| app.frame_ui(ctx));
+            h.time += 0.016;
+        };
+        let start = PathBuf::from(r"Z:\cullery-test");
+        let export = std::env::temp_dir().join(format!("cullery-drop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&export).unwrap();
+        let copy = export.join("IMG_0003.CR3");
+        std::fs::write(&copy, b"x").unwrap();
+
+        // Our own drag landing back on the window.
+        let mut h = Harness::new();
+        h.app.last_drag = [copy.clone()].into_iter().collect();
+        drop(&mut h, vec![copy.clone()]);
+        assert_eq!(h.app.folder.as_ref(), Some(&start));
+
+        // Photo files from elsewhere: a note, no switch.
+        h.app.last_drag.clear();
+        drop(&mut h, vec![copy.clone()]);
+        assert_eq!(h.app.folder.as_ref(), Some(&start));
+        assert!(h.app.message.is_some());
+
+        std::fs::remove_dir_all(&export).unwrap();
     }
 
     /// Esc closes Settings and nothing else: the grid selection behind it stays.
