@@ -1,3 +1,5 @@
 /target
 /test-photos
 /test-export
+# Local shortcut to the built app (holds this computer's path)
+/*.lnk
