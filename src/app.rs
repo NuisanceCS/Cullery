@@ -52,8 +52,8 @@ struct Item {
 }
 
 enum Action {
+    /// Select (or, as the second of a double-click, open).
     Click(usize),
-    Open(usize),
     TogglePick(usize),
     Mark(usize),
 }
@@ -124,6 +124,12 @@ pub struct App {
     last_layout: Option<LayoutKey>,
     /// Scroll position set by the scroll bar, applied next frame.
     pending_scroll: Option<f32>,
+    /// Where each grid tile was drawn last frame (used by tests to aim clicks).
+    drawn_tiles: Vec<(Item, Rect)>,
+    /// Last plain click on a tile (shot, time), for spotting double-clicks.
+    last_tile_click: Option<(usize, f64)>,
+    /// Longest gap between the clicks of a double-click, from Windows' setting.
+    double_click_time: f64,
 
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
@@ -150,9 +156,17 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_context(&cc.egui_ctx)
+    }
+
+    fn with_context(ctx: &egui::Context) -> Self {
         let p = theme::DARK;
-        theme::apply(&cc.egui_ctx, &p);
-        let ctx = cc.egui_ctx.clone();
+        theme::apply(ctx, &p);
+        // egui allows only 0.3 s between the clicks of a double-click (Windows: 0.5 s by
+        // default), measured end to end, so normal double-clicks often went unnoticed.
+        let double_click_time = system_double_click_time();
+        ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click_time);
+        let ctx = ctx.clone();
         Self {
             p,
             settings: Settings::load(),
@@ -173,6 +187,9 @@ impl App {
             view_anchor: None,
             last_layout: None,
             pending_scroll: None,
+            drawn_tiles: Vec::new(),
+            last_tile_click: None,
+            double_click_time,
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
@@ -986,6 +1003,7 @@ impl App {
         if background_click && actions.is_empty() && self.range_mode == RangeMode::Off {
             self.selected.clear();
         }
+        self.drawn_tiles = drawn;
 
         // Ask for thumbnails: visible rows first, then a few rows either side.
         let shots_in = |rows: std::ops::Range<usize>| -> Vec<usize> {
@@ -1009,8 +1027,19 @@ impl App {
 
         for action in actions {
             match action {
-                Action::Click(shot) => self.click_select(shot, &items, mods),
-                Action::Open(shot) => self.open_viewer(shot),
+                Action::Click(shot) => {
+                    // Second plain click on the same photo soon after the first: open it.
+                    let now = ui.input(|i| i.time);
+                    let double = mods.is_none()
+                        && self.last_tile_click.is_some_and(|(s, t)| s == shot && now - t <= self.double_click_time);
+                    if double {
+                        self.last_tile_click = None;
+                        self.open_viewer(shot);
+                    } else {
+                        self.click_select(shot, &items, mods);
+                        self.last_tile_click = mods.is_none().then_some((shot, now));
+                    }
+                }
                 Action::TogglePick(shot) => self.toggle_pick(shot),
                 Action::Mark(shot) => match self.range_mode {
                     RangeMode::PickEnd(start) => {
@@ -1162,10 +1191,9 @@ impl App {
             return (Some(Action::TogglePick(item.shot)), rect);
         }
         let resp = resp.on_hover_cursor(if selecting { CursorIcon::Crosshair } else { CursorIcon::Default });
+        // Double-clicks are spotted in grid_contents from two clicks in a row.
         let action = if selecting {
             resp.clicked().then_some(Action::Mark(item.shot))
-        } else if resp.double_clicked() {
-            Some(Action::Open(item.shot))
         } else {
             resp.clicked().then_some(Action::Click(item.shot))
         };
@@ -1342,6 +1370,13 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame_ui(ctx);
+    }
+}
+
+impl App {
+    /// Everything drawn and handled in one frame.
+    fn frame_ui(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         self.receive(ctx);
 
@@ -1458,6 +1493,24 @@ impl eframe::App for App {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// The double-click speed set in Windows (Mouse settings), in seconds, plus a little
+/// slack: Windows times press to press, egui release to release, once per frame.
+fn system_double_click_time() -> f64 {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetDoubleClickTime() -> u32;
+        }
+        // SAFETY: takes no arguments and only reads a system setting.
+        let ms = unsafe { GetDoubleClickTime() };
+        if (100..=5000).contains(&ms) {
+            return ms as f64 / 1000.0 + 0.05;
+        }
+    }
+    0.55
+}
 
 fn folder_name(dir: &Path) -> String {
     dir.file_name()
@@ -1682,4 +1735,145 @@ fn list_row(ui: &mut Ui, p: &Palette, title: &str, sub: Option<&str>, trailing: 
         p.label2,
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Event, PointerButton, RawInput};
+
+    /// The real app showing a grid of fake shots (their files don't exist, so
+    /// thumbnails stay blank, which doesn't matter for clicking).
+    struct Harness {
+        ctx: egui::Context,
+        app: App,
+        time: f64,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let mut app = App::with_context(&ctx);
+            app.folder = Some(PathBuf::from(r"Z:\cullery-test"));
+            app.shots = (0..60)
+                .map(|i| Shot {
+                    name: format!("IMG_{i:04}"),
+                    jpg: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.JPG"))),
+                    raw: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.CR3"))),
+                })
+                .collect();
+            app.picked.clear();
+            app.settings.show_raw = false;
+            app.settings.tile_width = 190.0;
+            let mut h = Self { ctx, app, time: 0.0 };
+            for _ in 0..3 {
+                h.frame(vec![], 0.016);
+            }
+            h
+        }
+
+        /// Runs one frame with these input events, then lets `dt` seconds pass.
+        fn frame(&mut self, events: Vec<Event>, dt: f64) {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let app = &mut self.app;
+            let _ = self.ctx.run(input, |ctx| app.frame_ui(ctx));
+            self.time += dt;
+        }
+
+        fn button(pos: Pos2, pressed: bool) -> Event {
+            Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() }
+        }
+
+        /// A tile's rect, by its position in the grid.
+        fn tile(&self, index: usize) -> Rect {
+            self.app.drawn_tiles[index].1
+        }
+
+        /// Double-clicks at `pos` (each click in its own frames, `gap` seconds apart)
+        /// and reports whether the viewer opened.
+        fn double_click(&mut self, pos: Pos2, gap: f64) -> bool {
+            self.frame(vec![Event::PointerMoved(pos)], 0.016);
+            self.frame(vec![Self::button(pos, true)], 0.06);
+            self.frame(vec![Self::button(pos, false)], gap);
+            self.frame(vec![Self::button(pos, true)], 0.06);
+            self.frame(vec![Self::button(pos, false)], 0.016);
+            self.frame(vec![], 0.016);
+            self.app.screen == Screen::Viewer
+        }
+    }
+
+    fn thumb_center(tile: Rect) -> Pos2 {
+        pos2(tile.center().x, tile.min.y + (tile.height() - NAME_AREA) / 2.0)
+    }
+
+    fn name_point(tile: Rect) -> Pos2 {
+        pos2(tile.center().x, tile.max.y - NAME_AREA + 16.0)
+    }
+
+    fn with_thumbnails(h: &mut Harness) {
+        for shot in 0..h.app.shots.len() {
+            let image = egui::ColorImage::new([400, 267], vec![Color32::GRAY; 400 * 267]);
+            let tex = h.ctx.load_texture(format!("t{shot}"), image, TextureOptions::LINEAR);
+            h.app.thumbs.insert(shot, Thumb { tex, kind: Kind::Thumb, last_used: 0 });
+        }
+        h.frame(vec![], 0.016);
+    }
+
+    /// Normal-speed double-clicks open a photo from its thumbnail or its name,
+    /// whether or not thumbnails have loaded. (Before the fix, anything slower than
+    /// about 0.25 s between clicks was missed.)
+    #[test]
+    fn double_click_opens_from_thumbnail_and_name() {
+        let window = system_double_click_time();
+        for gap in [0.1, 0.25, 0.35, window - 0.12] {
+            for loaded in [false, true] {
+                for (spot, point) in [("thumbnail", thumb_center as fn(Rect) -> Pos2), ("name", name_point)] {
+                    for index in [0, 7, 13] {
+                        let mut h = Harness::new();
+                        if loaded {
+                            with_thumbnails(&mut h);
+                        }
+                        let pos = point(h.tile(index));
+                        assert!(h.double_click(pos, gap), "{spot} of tile {index}, {gap}s apart, thumbnails {loaded}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clicking once to select and then double-clicking still opens the photo.
+    #[test]
+    fn click_then_double_click_opens() {
+        for pause in [0.3, 0.7, 1.2] {
+            let mut h = Harness::new();
+            let pos = thumb_center(h.tile(7));
+            h.frame(vec![Event::PointerMoved(pos)], 0.016);
+            h.frame(vec![Harness::button(pos, true)], 0.06);
+            h.frame(vec![Harness::button(pos, false)], pause);
+            assert!(h.double_click(pos, 0.2), "pause {pause}");
+        }
+    }
+
+    /// Slow clicks, or clicks on two different photos, only select.
+    #[test]
+    fn separate_clicks_do_not_open() {
+        let mut h = Harness::new();
+        assert!(!h.double_click(thumb_center(h.tile(7)), system_double_click_time() + 0.3));
+        assert!(h.app.selected.contains(&h.app.drawn_tiles[7].0.shot));
+
+        let mut h = Harness::new();
+        let (a, b) = (thumb_center(h.tile(7)), thumb_center(h.tile(8)));
+        h.frame(vec![Event::PointerMoved(a)], 0.016);
+        h.frame(vec![Harness::button(a, true)], 0.06);
+        h.frame(vec![Harness::button(a, false), Event::PointerMoved(b)], 0.1);
+        h.frame(vec![Harness::button(b, true)], 0.06);
+        h.frame(vec![Harness::button(b, false)], 0.016);
+        h.frame(vec![], 0.016);
+        assert!(h.app.screen == Screen::Grid);
+    }
 }
