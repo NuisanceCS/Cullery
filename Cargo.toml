@@ -1,0 +1,21 @@
+[package]
+name = "culler"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, simple photo culler for RAW+JPEG shoots"
+
+[dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+rfd = "0.15"
+jpeg-decoder = "0.3"
+kamadak-exif = "0.6"
+image = { version = "0.25", default-features = false }
+trash = "5"
+
+# Image decoding is painfully slow without optimizations, even while developing.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
