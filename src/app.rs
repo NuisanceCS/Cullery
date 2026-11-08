@@ -1674,6 +1674,34 @@ impl App {
         self.content_rect = panel.response.rect;
         self.settings_window(ctx);
         self.draw_toast(ctx);
+        self.draw_drop_overlay(ctx);
+    }
+
+    /// While something is dragged over the window: dim it, outline it in blue and say
+    /// what dropping will do (only folders open).
+    fn draw_drop_overlay(&self, ctx: &egui::Context) {
+        let hovered: Vec<PathBuf> = ctx.input(|i| i.raw.hovered_files.iter().filter_map(|f| f.path.clone()).collect());
+        let Some((title, detail)) = drop_hint(&hovered, &self.last_drag) else { return };
+        let p = self.p;
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("drop-overlay")));
+        painter.rect_filled(screen, 0, Color32::from_black_alpha(150));
+        painter.rect_stroke(screen.shrink(3.0), 8, Stroke::new(2.0_f32, p.accent), StrokeKind::Inside);
+
+        let title_g = painter.layout_no_wrap(title, theme::font_semibold(16.0), p.label);
+        let detail_g = detail.map(|d| painter.layout_no_wrap(d, theme::font(13.0), p.label2));
+        let width = title_g.size().x.max(detail_g.as_ref().map_or(0.0, |g| g.size().x)) + 56.0;
+        let height = 26.0 + title_g.size().y + detail_g.as_ref().map_or(0.0, |g| g.size().y + 6.0) + 26.0;
+        let card = Rect::from_center_size(screen.center(), vec2(width, height));
+        painter.rect_filled(card, 12, p.card);
+        painter.rect_stroke(card, 12, Stroke::new(1.0_f32, p.accent), StrokeKind::Inside);
+        let mut y = card.min.y + 26.0;
+        painter.galley(pos2(card.center().x - title_g.size().x / 2.0, y), title_g.clone(), p.label);
+        y += title_g.size().y + 6.0;
+        if let Some(g) = detail_g {
+            painter.galley(pos2(card.center().x - g.size().x / 2.0, y), g, p.label2);
+        }
+        ctx.request_repaint();
     }
 
     /// Settings: a sidebar of pages (Keybinds, Themes) and the chosen page.
@@ -1802,6 +1830,21 @@ fn themes_page(ui: &mut Ui, p: &Palette) {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// What dropping the hovered items would do: (title, detail), or `None` to show
+/// nothing (nothing hovered, or it's Cullery's own drag on its way out).
+fn drop_hint(hovered: &[PathBuf], own_drag: &HashSet<PathBuf>) -> Option<(String, Option<String>)> {
+    if hovered.is_empty() || hovered.iter().all(|p| own_drag.contains(p)) {
+        return None;
+    }
+    Some(match hovered.iter().find(|p| p.is_dir()) {
+        Some(dir) => (format!("Drop to open {}", folder_name(dir)), None),
+        None => (
+            "Drop a folder to open it".to_string(),
+            Some("Individual photos can't be opened. Drag in the folder they're in.".to_string()),
+        ),
+    })
+}
 
 /// The double-click speed set in Windows (Mouse settings), in seconds, plus a little
 /// slack: Windows times press to press, egui release to release, once per frame.
@@ -2301,6 +2344,27 @@ mod tests {
         assert!(h.app.message.is_some());
 
         std::fs::remove_dir_all(&export).unwrap();
+    }
+
+    /// The drop overlay names a dragged-in folder, explains that photos can't be
+    /// opened on their own, and stays hidden for Cullery's own drags.
+    #[test]
+    fn drop_overlay_messages() {
+        let dir = std::env::temp_dir().join(format!("cullery-hint-test-{}", std::process::id())).join("101CANON");
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("IMG_0001.CR3");
+        std::fs::write(&photo, b"x").unwrap();
+        let none = HashSet::new();
+
+        assert_eq!(drop_hint(&[], &none), None);
+        assert_eq!(drop_hint(&[dir.clone()], &none), Some(("Drop to open 101CANON".to_string(), None)));
+        let (title, detail) = drop_hint(&[photo.clone()], &none).unwrap();
+        assert_eq!(title, "Drop a folder to open it");
+        assert!(detail.unwrap().contains("Individual photos"));
+        let own: HashSet<PathBuf> = [photo.clone()].into_iter().collect();
+        assert_eq!(drop_hint(&[photo], &own), None);
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     /// Esc closes Settings and nothing else: the grid selection behind it stays.
