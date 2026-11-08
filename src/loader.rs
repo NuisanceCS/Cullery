@@ -210,6 +210,53 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
     }
 }
 
+/// A small picture of a photo, made quickly for the drag-out stack: the camera's
+/// embedded thumbnail where there is one (a few KB read), with black bars trimmed.
+pub fn quick_picture(path: &Path, max: [u32; 2]) -> Option<ColorImage> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let image = if raw::is_raw_extension(&ext) {
+        decode_raw(path, Kind::Thumb, max)
+    } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) {
+        decode_with_image_crate(path, max)
+    } else if WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
+        decode_with_windows(path, max)
+    } else {
+        decode_embedded_thumbnail(path).or_else(|_| decode_file(path, max))
+    };
+    image.ok().map(|(img, _)| trim_black_bars(img))
+}
+
+/// Removes the black bars cameras put above and below (or beside) a thumbnail stored in
+/// a different shape from the photo.
+fn trim_black_bars(img: ColorImage) -> ColorImage {
+    let [w, h] = img.size;
+    let dark = |c: egui::Color32| c.r().max(c.g()).max(c.b()) < 12;
+    let row_dark = |y: usize| (0..w).all(|x| dark(img.pixels[y * w + x]));
+    let col_dark = |x: usize| (0..h).all(|y| dark(img.pixels[y * w + x]));
+    let (mut top, mut bottom, mut left, mut right) = (0, h, 0, w);
+    while top < bottom && row_dark(top) {
+        top += 1;
+    }
+    while bottom > top && row_dark(bottom - 1) {
+        bottom -= 1;
+    }
+    while left < right && col_dark(left) {
+        left += 1;
+    }
+    while right > left && col_dark(right - 1) {
+        right -= 1;
+    }
+    // An all-dark photo, or barely anything trimmed: keep it whole.
+    if bottom - top < h / 2 || right - left < w / 2 || (top, bottom, left, right) == (0, h, 0, w) {
+        return img;
+    }
+    let mut pixels = Vec::with_capacity((bottom - top) * (right - left));
+    for y in top..bottom {
+        pixels.extend_from_slice(&img.pixels[y * w + left..y * w + right]);
+    }
+    ColorImage { size: [right - left, bottom - top], pixels, ..img }
+}
+
 /// Shrinks `img` to fit within `max` (never enlarges).
 fn fit_within(img: RgbaImage, max: [u32; 2]) -> RgbaImage {
     let (w, h) = img.dimensions();

@@ -94,6 +94,19 @@ struct Item {
     raw: bool,
 }
 
+/// A drag out of the window: its files and the overlay's text. `shown` once the overlay
+/// has been drawn, so the drag can start.
+struct PendingDrag {
+    paths: Vec<PathBuf>,
+    /// Up to three photos' files for the stack under the cursor, front first.
+    stack: Vec<PathBuf>,
+    photos: usize,
+    title: String,
+    count: String,
+    note: String,
+    shown: bool,
+}
+
 enum Action {
     /// Select (or, as the second of a double-click, open).
     Click(usize),
@@ -211,6 +224,8 @@ pub struct App {
     hwnd: Option<isize>,
     /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
     last_drag: HashSet<PathBuf>,
+    /// A drag out of the window about to start, shown by its overlay first.
+    pending_drag: Option<PendingDrag>,
 
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
@@ -304,6 +319,7 @@ impl App {
             view_picked: false,
             hwnd: None,
             last_drag: HashSet::new(),
+            pending_drag: None,
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
@@ -943,11 +959,62 @@ impl App {
         shots.sort_unstable();
         let paths = self.drag_paths(&shots);
         self.last_drag = paths.iter().cloned().collect();
+        let (title, count, note) = drag_out_hint(&shots.iter().map(|&s| &self.shots[s]).collect::<Vec<_>>(), self.settings.drag_files);
+        // The window can't redraw while Windows runs the drag, so this frame shows the
+        // overlay and the next one hands the drag to Windows (the overlay stays on screen
+        // until the drop).
+        // The stack under the cursor: the photo grabbed in front, then the rest.
+        let order: Vec<usize> = std::iter::once(shot).chain(shots.iter().copied().filter(|&s| s != shot)).collect();
+        let stack: Vec<PathBuf> = order.iter().filter_map(|&s| self.shots[s].display_path().cloned()).take(3).collect();
+        self.pending_drag = Some(PendingDrag { paths, stack, photos: shots.len(), title, count, note, shown: false });
+        self.last_tile_click = None;
+    }
+
+    /// Starts the drag set up by `drag_out`, once its overlay has been on screen.
+    fn start_pending_drag(&mut self, ctx: &egui::Context) {
+        if !self.pending_drag.as_ref().is_some_and(|d| d.shown) {
+            return;
+        }
+        let Some(drag) = self.pending_drag.take() else { return };
         let Some(hwnd) = self.hwnd else { return };
-        if let Err(e) = crate::dragout::drag_files(hwnd, &paths) {
+        let scale = ctx.pixels_per_point();
+        let px = (110.0 * scale).round() as u32;
+        let pictures: Vec<egui::ColorImage> =
+            drag.stack.iter().filter_map(|p| crate::loader::quick_picture(p, [px, px])).collect();
+        let image = crate::dragimage::stack(&pictures, drag.photos, self.p.accent, scale);
+        if let Err(e) = crate::dragout::drag_files(hwnd, &drag.paths, Some(&image)) {
             self.error(format!("Couldn't start the drag: {e}"));
         }
-        self.last_tile_click = None;
+    }
+
+    /// While photos are dragged out: dim the window and say what's being sent.
+    fn draw_drag_out_overlay(&mut self, ctx: &egui::Context) {
+        let Some(drag) = &mut self.pending_drag else { return };
+        drag.shown = true;
+        let p = self.p;
+        let screen = ctx.screen_rect();
+        let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("drag-out-overlay")));
+        painter.rect_filled(screen, 0, Color32::from_black_alpha(170));
+
+        let lines = [
+            painter.layout_no_wrap(drag.title.clone(), theme::font_semibold(18.0), p.label),
+            painter.layout_no_wrap(drag.count.clone(), theme::font_semibold(14.0), p.tint),
+            painter.layout_no_wrap(drag.note.clone(), theme::font(13.0), p.label2),
+        ];
+        let gaps = [10.0, 4.0];
+        let width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max) + 64.0;
+        let height = 28.0 + lines.iter().map(|g| g.size().y).sum::<f32>() + gaps.iter().sum::<f32>() + 28.0;
+        let card = Rect::from_center_size(screen.center(), vec2(width, height));
+        let r = theme::around(p.r_card, 2);
+        painter.rect_filled(card, r, p.card);
+        painter.rect_stroke(card, r, Stroke::new(1.0_f32, p.separator), StrokeKind::Inside);
+        let mut y = card.min.y + 28.0;
+        for (i, g) in lines.into_iter().enumerate() {
+            let h = g.size().y;
+            painter.galley(pos2(card.center().x - g.size().x / 2.0, y), g, p.label);
+            y += h + gaps.get(i).copied().unwrap_or(0.0);
+        }
+        ctx.request_repaint();
     }
 
     /// The files to drag for these shots, per the Settings choice. A file already copied
@@ -1846,6 +1913,7 @@ impl App {
         self.receive(ctx);
 
         self.handle_drops(ctx);
+        self.start_pending_drag(ctx);
 
         #[derive(Default)]
         struct Keys {
@@ -1980,6 +2048,7 @@ impl App {
         self.delete_dialog(ctx);
         self.draw_toast(ctx);
         self.draw_drop_overlay(ctx);
+        self.draw_drag_out_overlay(ctx);
     }
 
     /// While something is dragged over the window: dim it, outline it in blue and say
@@ -2338,6 +2407,24 @@ fn codec_help_panel(ui: &mut Ui, p: &Palette, area: Rect, help: &CodecHelp) {
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
+}
+
+/// The drag-out overlay's text: (title, how many photos, which files go).
+fn drag_out_hint(shots: &[&Shot], choice: DragFiles) -> (String, String, String) {
+    let n = shots.len();
+    let count = format!("{n} {}", plural(n, "photo", "photos"));
+    let with_raw = shots.iter().filter(|s| s.raw.is_some()).count();
+    let with_image = shots.iter().filter(|s| s.image.is_some()).count();
+    let note = match choice {
+        DragFiles::Raw if with_raw == n => "Only the RAW files will be sent".to_string(),
+        DragFiles::Raw if with_raw == 0 => "No RAW files, so the JPGs will be sent".to_string(),
+        DragFiles::Raw => "Only the RAW files will be sent (JPGs for photos without one)".to_string(),
+        DragFiles::Jpg if with_image == n => "Only the JPG files will be sent".to_string(),
+        DragFiles::Jpg if with_image == 0 => "No JPG files, so the RAWs will be sent".to_string(),
+        DragFiles::Jpg => "Only the JPG files will be sent (RAWs for photos without one)".to_string(),
+        DragFiles::Both => "JPG + RAW files will be sent".to_string(),
+    };
+    ("Drop into a folder or Lightroom".to_string(), count, note)
 }
 
 /// What dropping the hovered items would do: (title, detail), or `None` to show
@@ -2866,6 +2953,39 @@ mod tests {
         // which photos it would carry: the one under the pointer, as it wasn't selected.
         assert_eq!(h.app.selected, [h.app.drawn_tiles[7].0.shot].into_iter().collect());
         assert!(h.app.screen == Screen::Grid);
+        // The overlay showed, then the drag was handed off (here: dropped, as there's no
+        // window), so the overlay is gone.
+        assert!(h.app.pending_drag.is_none());
+    }
+
+    /// The drag-out overlay's text: overlay drawn for one frame before the drag starts,
+    /// with the photo count and which files go.
+    #[test]
+    fn drag_out_overlay_says_what_is_sent() {
+        let mut h = Harness::new();
+        let pos = thumb_center(h.tile(2));
+        h.frame(vec![Event::PointerMoved(pos)], 0.016);
+        h.frame(vec![Harness::button(pos, true)], 0.016);
+        let mut seen = None;
+        for step in 1..=4 {
+            h.frame(vec![Event::PointerMoved(pos + vec2(8.0 * step as f32, 0.0))], 0.016);
+            if let Some(d) = &h.app.pending_drag {
+                seen = Some((d.title.clone(), d.count.clone(), d.shown));
+            }
+        }
+        let (title, count, shown) = seen.expect("the overlay appears when the drag starts");
+        assert!(title.contains("Lightroom"));
+        assert_eq!(count, "1 photo");
+        assert!(shown);
+
+        let both = Shot { name: "A".into(), key: "a".into(), image: Some("A.JPG".into()), raw: Some("A.CR3".into()) };
+        let jpg_only = Shot { name: "B".into(), key: "b".into(), image: Some("B.JPG".into()), raw: None };
+        let (_, count, note) = drag_out_hint(&[&both, &both], DragFiles::Raw);
+        assert_eq!((count.as_str(), note.as_str()), ("2 photos", "Only the RAW files will be sent"));
+        assert!(drag_out_hint(&[&both, &jpg_only], DragFiles::Raw).2.contains("JPGs for photos without one"));
+        assert!(drag_out_hint(&[&jpg_only], DragFiles::Raw).2.starts_with("No RAW files"));
+        assert_eq!(drag_out_hint(&[&both], DragFiles::Jpg).2, "Only the JPG files will be sent");
+        assert_eq!(drag_out_hint(&[&both], DragFiles::Both).2, "JPG + RAW files will be sent");
     }
 
     /// Only a dropped folder changes the open folder. Dropped files — including photos

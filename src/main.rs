@@ -3,6 +3,7 @@
 
 mod app;
 mod devices;
+mod dragimage;
 mod dragout;
 mod export;
 mod library;
