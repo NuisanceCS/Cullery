@@ -336,6 +336,9 @@ pub const WIN10_LIGHT: Palette = Palette {
     r_thumb: 0,
 };
 
+/// Fill of the confirm-delete button (white text on it in every theme).
+pub const DELETE_RED: Color32 = rgb(0xD70015);
+
 /// Family used for semibold text (falls back to the regular font).
 pub fn semibold() -> FontFamily {
     FontFamily::Name("semibold".into())

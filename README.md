@@ -25,6 +25,10 @@ The built app is `target\release\cullery.exe`.
 - **Drag out:** drag a photo (or a selection) from the grid into Lightroom, LightCraft, Explorer
   or any app that takes dropped files; it arrives as one group. Settings → Drag & Drop picks
   RAW (default), JPG or both. Copies already in the export folder are sent from there.
+- **Delete** (trash button, or the `Delete` key): asks first, then deletes the selected
+  photos (or the one in the viewer) with their RAW files — to the Recycle Bin, or
+  permanently from a memory card (which has no Recycle Bin; the dialog says so).
+  Export-folder copies are kept.
 - **Themes** (Settings → Themes): Apple, Windows 11 (with the Mica wallpaper-tinted top bar,
   on Windows 11 22H2+) and Windows 10, each in dark and light.
 - **Quick Export** (`Ctrl+E`): copies the selected photos (or the one in the viewer) to the

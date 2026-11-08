@@ -124,6 +124,55 @@ fn remove_copies(files: &[PathBuf], dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Deletes photo files: to the Recycle Bin, or permanently when `permanent` (memory
+/// cards have no Recycle Bin). Stops at the first failure.
+pub fn delete_files(files: &[PathBuf], permanent: bool) -> Result<(), String> {
+    if permanent {
+        for f in files {
+            std::fs::remove_file(f).map_err(|e| {
+                format!("Couldn't delete {}: {e}", f.file_name().unwrap_or_default().to_string_lossy())
+            })?;
+        }
+        Ok(())
+    } else {
+        trash::delete_all(files).map_err(|e| format!("Couldn't move the photos to the Recycle Bin: {e}"))
+    }
+}
+
+/// Whether `path` is on a removable drive (memory card, USB stick), where Windows has
+/// no Recycle Bin.
+#[cfg(windows)]
+pub fn on_removable_drive(path: &Path) -> bool {
+    use std::path::Component;
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOVABLE: u32 = 2;
+    let Some(Component::Prefix(prefix)) = path.components().next() else { return false };
+    let root = HSTRING::from(format!("{}\\", prefix.as_os_str().to_string_lossy()));
+    // SAFETY: reads the type of a drive given its root path.
+    unsafe { GetDriveTypeW(&root) == DRIVE_REMOVABLE }
+}
+
+#[cfg(not(windows))]
+pub fn on_removable_drive(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The system drive is never removable; a memory card in F: (if present) is.
+    #[test]
+    fn detects_removable_drives() {
+        assert!(!on_removable_drive(Path::new(r"C:\Users")));
+        let card = Path::new(r"F:\DCIM");
+        if card.exists() {
+            println!("F:\\DCIM removable: {}", on_removable_drive(card));
+        }
+    }
+}
+
 fn is_copy_of(target: &Path, src: &Path) -> bool {
     match (std::fs::metadata(target), std::fs::metadata(src)) {
         (Ok(t), Ok(s)) => t.is_file() && t.len() == s.len(),

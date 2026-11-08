@@ -12,7 +12,7 @@ use eframe::egui::{
 };
 
 use crate::devices::{self, CardFolder};
-use crate::export::{Done, Exporter};
+use crate::export::{self, Done, Exporter};
 use crate::library::{self, Shot};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
@@ -55,6 +55,7 @@ const GRID_KEYS: &[(&str, &str)] = &[
     ("P  /  Space", "Pick the selected photos (again to unpick)"),
     ("Drag a photo", "Drag it (or the whole selection) into another app or folder"),
     ("Ctrl + E", "Quick Export the selected photos"),
+    ("Delete", "Delete the selected photos (asks first)"),
     ("Esc", "Clear the selection, or cancel Select Range"),
     ("Ctrl + O", "Open a folder"),
 ];
@@ -63,6 +64,7 @@ const VIEWER_KEYS: &[(&str, &str)] = &[
     ("Home  /  End", "First / last photo"),
     ("P  /  Space", "Pick (again to unpick)"),
     ("Ctrl + E", "Quick Export this photo"),
+    ("Delete", "Delete this photo (asks first)"),
     ("Scroll wheel", "Zoom around the cursor"),
     ("Double-click", "Zoom to that spot, or back to fit"),
     ("Drag", "Move around while zoomed"),
@@ -166,6 +168,8 @@ pub struct App {
     last_tile_click: Option<(usize, f64)>,
     /// Last click on the viewer's photo (time, position), for double-click zoom.
     last_viewer_click: Option<(f64, Pos2)>,
+    /// Shots waiting for the user to confirm deleting them.
+    confirm_delete: Option<Vec<usize>>,
     /// Longest gap between the clicks of a double-click, from Windows' setting.
     double_click_time: f64,
     /// The settings window, and which page it shows.
@@ -262,6 +266,7 @@ impl App {
             drawn_tiles: Vec::new(),
             last_tile_click: None,
             last_viewer_click: None,
+            confirm_delete: None,
             double_click_time,
             settings_page: None,
             view_picked: false,
@@ -836,11 +841,16 @@ impl App {
         }
         size_icon(ui, &p, 15.0);
 
-        // Pick button in the middle of the bar, for everything selected.
-        let pad = bar.center().x - PICK_W / 2.0 - ui.cursor().min.x;
+        // Delete, then the Pick button centered in the bar, for everything selected.
+        let pad = bar.center().x - PICK_W / 2.0 - TRASH_GAP - TRASH_W - ui.cursor().min.x;
         if pad > 0.0 {
             ui.add_space(pad);
         }
+        let tip = "Delete the selected photos and their RAW files (Delete)";
+        if trash_button(ui, &p, !self.selected.is_empty()).on_hover_text(tip).clicked() {
+            self.request_delete();
+        }
+        ui.add_space(TRASH_GAP - ui.spacing().item_spacing.x);
         let n = self.selected.len();
         let all_picked = n > 0 && self.selected.iter().all(|s| self.picked.contains(s));
         let label = match (n, all_picked) {
@@ -936,6 +946,161 @@ impl App {
         }
     }
 
+    /// Asks to delete the selected photos (grid) or the shown one (viewer).
+    fn request_delete(&mut self) {
+        let mut shots: Vec<usize> = match self.screen {
+            Screen::Viewer if !self.shots.is_empty() => vec![self.current],
+            _ => self.selected.iter().copied().collect(),
+        };
+        shots.sort_unstable();
+        if shots.is_empty() {
+            self.message = Some(("Select photos to delete first".into(), false));
+            return;
+        }
+        self.confirm_delete = Some(shots);
+    }
+
+    /// The "Are you sure?" dialog for deleting photos.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(shots) = self.confirm_delete.clone() else { return };
+        let p = self.p;
+        let jpgs = shots.iter().filter(|&&s| self.shots[s].jpg.is_some()).count();
+        let raws = shots.iter().filter(|&&s| self.shots[s].raw.is_some()).count();
+        let n = shots.len();
+        let permanent = self.folder.as_deref().is_some_and(export::on_removable_drive);
+
+        let title = if n == 1 { "Delete this photo?".to_string() } else { format!("Delete {n} photos?") };
+        let what = match (jpgs, raws) {
+            (0, r) => format!("This deletes {r} RAW {}.", plural(r, "file", "files")),
+            (j, 0) => format!("This deletes {j} {} (no RAW files).", plural(j, "JPG", "JPGs")),
+            (j, r) if j == r => format!(
+                "This deletes {j} {} and {} {r} RAW {} ({} files).",
+                plural(j, "JPG", "JPGs"),
+                if r == 1 { "its" } else { "their" },
+                plural(r, "file", "files"),
+                j + r
+            ),
+            (j, r) => format!(
+                "This deletes {j} {} and {r} RAW {} ({} files).",
+                plural(j, "JPG", "JPGs"),
+                plural(r, "file", "files"),
+                j + r
+            ),
+        };
+        let where_to = if permanent {
+            "This is a memory card, which has no Recycle Bin: the files will be deleted permanently. This can't be undone."
+        } else {
+            "They'll go to the Recycle Bin, where you can restore them."
+        };
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(Id::new("confirm-delete"))
+            .frame(Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new(title).font(theme::font_semibold(17.0)));
+                ui.add_space(6.0);
+                ui.label(RichText::new(what).color(p.label));
+                ui.add_space(4.0);
+                ui.label(RichText::new(where_to).color(if permanent { p.danger } else { p.label2 }));
+                if self.shots.len() > 0 && shots.iter().any(|s| self.picked.contains(s)) {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Copies already in your export folder are kept.").color(p.label2));
+                }
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let delete = Button::new(RichText::new("Delete").color(Color32::WHITE).font(theme::font_semibold(13.5)))
+                        .fill(theme::DELETE_RED)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(p.r_ctl)
+                        .min_size(vec2(96.0, 32.0));
+                    if ui.add(delete).clicked() {
+                        confirmed = true;
+                    }
+                    let cancel = Button::new("Cancel").corner_radius(p.r_ctl).min_size(vec2(96.0, 32.0));
+                    if ui.add(cancel).clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.confirm_delete = None;
+            self.delete_shots(ctx, &shots, permanent);
+        } else if cancelled || modal.should_close() {
+            self.confirm_delete = None;
+        }
+    }
+
+    /// Deletes these shots' files, then refreshes the folder without losing the view.
+    fn delete_shots(&mut self, ctx: &egui::Context, shots: &[usize], permanent: bool) {
+        let files: Vec<PathBuf> = shots.iter().flat_map(|&s| self.shots[s].files().cloned()).collect();
+        let result = export::delete_files(&files, permanent);
+
+        // In the viewer, move on to the next photo that's staying (or the one before).
+        if self.screen == Screen::Viewer {
+            let set = self.working_set();
+            let pos = set.iter().position(|&s| s == self.current).unwrap_or(0);
+            let staying = |s: &usize| !shots.contains(s);
+            if let Some(&next) = set[pos..].iter().find(|s| staying(s)).or_else(|| set[..pos].iter().rev().find(|s| staying(s))) {
+                self.current = next;
+            }
+        }
+        self.refresh_folder();
+        if self.screen == Screen::Viewer && self.working_set().is_empty() {
+            self.back_to_grid();
+        }
+
+        match result {
+            Ok(()) => {
+                let n = shots.len();
+                let verb = if permanent { "Deleted" } else { "Moved to the Recycle Bin:" };
+                self.show_toast(ctx, format!("{verb} {n} {}", plural(n, "photo", "photos")));
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// Rescans the open folder after files changed, keeping thumbnails, picks,
+    /// selection, the viewed photo and the range (all matched up by shot name).
+    fn refresh_folder(&mut self) {
+        let Some(dir) = self.folder.clone() else { return };
+        let Ok(new_shots) = library::scan(&dir) else { return };
+        let index: HashMap<String, usize> =
+            new_shots.iter().enumerate().map(|(i, s)| (s.name.to_lowercase(), i)).collect();
+        let old = std::mem::replace(&mut self.shots, new_shots);
+        let remap = |i: usize| old.get(i).and_then(|s| index.get(&s.name.to_lowercase())).copied();
+
+        self.thumbs = std::mem::take(&mut self.thumbs).into_iter().filter_map(|(i, t)| Some((remap(i)?, t))).collect();
+        self.picked = self.picked.iter().filter_map(|&i| remap(i)).collect();
+        self.selected = self.selected.iter().filter_map(|&i| remap(i)).collect();
+        self.select_anchor = self.select_anchor.and_then(remap);
+        // The viewed photo: itself, or the nearest remaining one.
+        self.current = remap(self.current)
+            .or_else(|| (self.current..old.len()).find_map(remap))
+            .or_else(|| (0..self.current).rev().find_map(remap))
+            .unwrap_or(0);
+        self.range = self.range.and_then(|(from, to)| {
+            let kept: Vec<usize> = (from..=to).filter_map(remap).collect();
+            Some((*kept.first()?, *kept.last()?))
+        });
+        if let RangeMode::PickEnd(s) = self.range_mode {
+            self.range_mode = remap(s).map_or(RangeMode::PickStart, RangeMode::PickEnd);
+        }
+
+        // Anything loading was for the old numbering.
+        self.generation = self.loader.reset();
+        self.fulls.clear();
+        self.original = None;
+        self.failed.clear();
+        self.last_tile_click = None;
+        self.reset_zoom();
+        self.save_picks();
+        if self.shots.is_empty() {
+            self.message = Some(("No JPG or RAW files left in this folder".into(), false));
+        }
+    }
+
     fn set_view_picked(&mut self, on: bool) {
         self.view_picked = on;
         if on {
@@ -975,6 +1140,10 @@ impl App {
         let p = self.p;
         let bar = ui.max_rect();
         self.quick_export_button(ui, true);
+        ui.add_space(TRASH_GAP - ui.spacing().item_spacing.x);
+        if trash_button(ui, &p, true).on_hover_text("Delete this photo and its RAW file (Delete)").clicked() {
+            self.request_delete();
+        }
 
         // Zoom indicator, then prev / pick / next, with the pick button centered in the window.
         const ZOOM_W: f32 = 64.0;
@@ -1616,6 +1785,7 @@ impl App {
         struct Keys {
             /// The mouse's back button (usually "Mouse 4", the side button nearer you).
             back: bool,
+            delete: bool,
             open: bool,
             export: bool,
             select_all: bool,
@@ -1639,7 +1809,12 @@ impl App {
             home: i.key_pressed(KeyCode::Home),
             end: i.key_pressed(KeyCode::End),
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
+            delete: i.key_pressed(KeyCode::Delete),
         });
+        // While the delete confirmation is up, it gets the keys (Esc cancels it).
+        if self.confirm_delete.is_some() {
+            k = Keys::default();
+        }
         // While Settings is open, keys don't reach the grid or viewer; Esc or the mouse
         // back button closes it.
         if self.settings_page.is_some() {
@@ -1653,6 +1828,9 @@ impl App {
         }
         if k.export && self.folder.is_some() {
             self.quick_export();
+        }
+        if k.delete && self.folder.is_some() && self.range_mode == RangeMode::Off {
+            self.request_delete();
         }
         match self.screen {
             Screen::Viewer if !self.shots.is_empty() => {
@@ -1723,6 +1901,7 @@ impl App {
         });
         self.content_rect = panel.response.rect;
         self.settings_window(ctx);
+        self.delete_dialog(ctx);
         self.draw_toast(ctx);
         self.draw_drop_overlay(ctx);
     }
@@ -1917,6 +2096,10 @@ fn theme_card(ui: &mut Ui, p: &Palette, id: ThemeId, selected: bool) -> Response
 
 // -------------------------------------------------------------------- helpers
 
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
 /// What dropping the hovered items would do: (title, detail), or `None` to show
 /// nothing (nothing hovered, or it's Cullery's own drag on its way out).
 fn drop_hint(hovered: &[PathBuf], own_drag: &HashSet<PathBuf>) -> Option<(String, Option<String>)> {
@@ -1989,6 +2172,46 @@ fn chevron(painter: &egui::Painter, c: Pos2, half_h: f32, left: bool, width: f32
 }
 
 const PICK_W: f32 = 130.0;
+/// The delete button: a little smaller than Pick, with a small gap beside it.
+const TRASH_W: f32 = 40.0;
+const TRASH_GAP: f32 = 12.0;
+
+/// Square button with a red trash can, for deleting photos.
+fn trash_button(ui: &mut Ui, p: &Palette, enabled: bool) -> Response {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(TRASH_W), sense);
+    let painter = ui.painter();
+    let hovered = enabled && resp.hovered();
+    let fill = if enabled && resp.is_pointer_button_down_on() {
+        theme::shade(p, p.control, 24)
+    } else if hovered {
+        theme::shade(p, p.control, 12)
+    } else {
+        p.control
+    };
+    let border = if hovered { p.danger } else { p.control_border };
+    let r = p.r_pill.min(10);
+    painter.rect_filled(rect, r, fill);
+    painter.rect_stroke(rect, r, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+
+    // The can: lid, handle, tapered body and two ribs.
+    let color = if enabled { p.danger } else { p.label2.gamma_multiply(0.5) };
+    let stroke = Stroke::new(1.8_f32, color);
+    let c = rect.center();
+    painter.line_segment([c + vec2(-8.0, -6.0), c + vec2(8.0, -6.0)], stroke);
+    painter.add(Shape::line(vec![c + vec2(-3.0, -6.0), c + vec2(-3.0, -9.0), c + vec2(3.0, -9.0), c + vec2(3.0, -6.0)], stroke));
+    painter.add(Shape::closed_line(
+        vec![c + vec2(-6.0, -4.0), c + vec2(6.0, -4.0), c + vec2(4.8, 9.0), c + vec2(-4.8, 9.0)],
+        stroke,
+    ));
+    painter.line_segment([c + vec2(-2.0, -1.0), c + vec2(-1.7, 6.0)], stroke);
+    painter.line_segment([c + vec2(2.0, -1.0), c + vec2(1.7, 6.0)], stroke);
+    if enabled {
+        resp.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
 const SCROLLBAR_W: f32 = 14.0;
 
 /// Thin scroll bar with small arrow buttons, in its own strip (like Chromium's on Windows).
@@ -2510,6 +2733,88 @@ mod tests {
         h.app.settings_page = Some(SettingsPage::Themes);
         h.frame(vec![back(true)], 0.016);
         assert!(h.app.settings_page.is_none());
+    }
+
+    /// A real folder of six JPG + CR3 shots, opened in the harness.
+    fn harness_with_files(tag: &str) -> (Harness, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cullery-delete-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("IMG_{i:04}.JPG")), b"x").unwrap();
+            std::fs::write(dir.join(format!("IMG_{i:04}.CR3")), b"x").unwrap();
+        }
+        let mut h = Harness::new();
+        h.app.folder = Some(dir.clone());
+        h.app.shots = library::scan(&dir).unwrap();
+        h.app.picked.clear();
+        h.app.selected.clear();
+        h.app.thumbs.clear();
+        h.frame(vec![], 0.016);
+        (h, dir)
+    }
+
+    fn cleanup(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(f) = picks::file_for(dir) {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// Deleting removes each shot's JPG and RAW; picks, selection and thumbnails
+    /// still point at the right photos afterwards.
+    #[test]
+    fn delete_removes_both_files_and_keeps_the_rest_in_place() {
+        let (mut h, dir) = harness_with_files("grid");
+        h.app.picked = [2, 4].into_iter().collect();
+        h.app.selected = [1, 2].into_iter().collect();
+        let image = egui::ColorImage::new([4, 4], vec![Color32::GRAY; 16]);
+        let tex = h.ctx.load_texture("t", image, TextureOptions::LINEAR);
+        h.app.thumbs.insert(4, Thumb { tex, kind: Kind::Thumb, last_used: 0 });
+
+        let ctx = h.ctx.clone();
+        h.app.delete_shots(&ctx, &[1, 2], true);
+
+        let left: Vec<String> = h.app.shots.iter().map(|s| s.name.clone()).collect();
+        assert_eq!(left, ["IMG_0000", "IMG_0003", "IMG_0004", "IMG_0005"]);
+        for gone in ["IMG_0001.JPG", "IMG_0001.CR3", "IMG_0002.JPG", "IMG_0002.CR3"] {
+            assert!(!dir.join(gone).exists(), "{gone} should be deleted");
+        }
+        assert!(dir.join("IMG_0003.CR3").exists());
+        // IMG_0004 (was #4, now #2) is still picked and keeps its thumbnail.
+        assert_eq!(h.app.picked, [2].into_iter().collect());
+        assert!(h.app.thumbs.contains_key(&2));
+        assert!(h.app.selected.is_empty());
+        cleanup(&dir);
+    }
+
+    /// Deleting in the viewer moves on to the next photo.
+    #[test]
+    fn delete_in_viewer_moves_to_next_photo() {
+        let (mut h, dir) = harness_with_files("viewer");
+        h.app.open_viewer(3);
+        let ctx = h.ctx.clone();
+        h.app.delete_shots(&ctx, &[3], true);
+        assert!(h.app.screen == Screen::Viewer);
+        assert_eq!(h.app.shots[h.app.current].name, "IMG_0004");
+        cleanup(&dir);
+    }
+
+    /// The confirmation comes first; Esc cancels and nothing is deleted.
+    #[test]
+    fn delete_asks_first_and_esc_cancels() {
+        let (mut h, dir) = harness_with_files("cancel");
+        h.app.selected = [0].into_iter().collect();
+        let key = |key| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        h.frame(vec![key(KeyCode::Delete)], 0.016);
+        assert_eq!(h.app.confirm_delete, Some(vec![0]));
+        h.frame(vec![], 0.016);
+        h.frame(vec![key(KeyCode::Escape)], 0.016);
+        h.frame(vec![], 0.016);
+        assert!(h.app.confirm_delete.is_none());
+        assert!(dir.join("IMG_0000.JPG").exists() && dir.join("IMG_0000.CR3").exists());
+        assert!(h.app.selected.contains(&0), "Esc on the dialog doesn't clear the selection");
+        cleanup(&dir);
     }
 
     /// Esc closes Settings and nothing else: the grid selection behind it stays.

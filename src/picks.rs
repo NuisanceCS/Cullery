@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-fn file_for(folder: &Path) -> Option<PathBuf> {
+pub fn file_for(folder: &Path) -> Option<PathBuf> {
     let key = folder.to_string_lossy().to_lowercase();
     Some(crate::settings::data_dir()?.join("picks").join(format!("{:016x}.txt", fnv1a(key.as_bytes()))))
 }
