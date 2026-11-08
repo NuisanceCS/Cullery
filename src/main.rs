@@ -11,6 +11,7 @@ mod picks;
 mod raw;
 mod settings;
 mod theme;
+mod wic;
 mod window;
 
 fn main() -> eframe::Result {

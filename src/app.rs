@@ -103,6 +103,27 @@ struct FullImage {
     tex: TextureHandle,
     /// The photo's real size in pixels.
     original: Vec2,
+    /// An animated GIF's frames and how long each shows (seconds); empty when still.
+    frames: Vec<(TextureHandle, f64)>,
+}
+
+impl FullImage {
+    /// The texture to show at `time` (seconds): the frame due then for an animation,
+    /// and how long until the next frame is due.
+    fn frame_at(&self, time: f64) -> (&TextureHandle, Option<f64>) {
+        let total: f64 = self.frames.iter().map(|(_, d)| d).sum();
+        if self.frames.is_empty() || total <= 0.0 {
+            return (&self.tex, None);
+        }
+        let mut t = time % total;
+        for (tex, delay) in &self.frames {
+            if t < *delay {
+                return (tex, Some(delay - t));
+            }
+            t -= delay;
+        }
+        (&self.frames[0].0, Some(0.0))
+    }
 }
 
 struct Toast {
@@ -364,7 +385,7 @@ impl App {
         match picks::load(folder) {
             Some(names) => {
                 for (i, shot) in self.shots.iter().enumerate() {
-                    if names.contains(&shot.name.to_lowercase()) {
+                    if names.contains(&shot.key) {
                         self.picked.insert(i);
                     }
                 }
@@ -394,7 +415,7 @@ impl App {
 
     fn save_picks(&self) {
         let Some(folder) = &self.folder else { return };
-        picks::save(folder, self.picked.iter().map(|&i| self.shots[i].name.as_str()));
+        picks::save(folder, self.picked.iter().map(|&i| self.shots[i].key.as_str()));
     }
 
     fn toggle_pick(&mut self, shot: usize) {
@@ -499,10 +520,10 @@ impl App {
         let mut items = Vec::new();
         for shot in self.working_set() {
             let s = &self.shots[shot];
-            if s.raw.is_some() && (self.settings.show_raw || s.jpg.is_none()) {
+            if s.raw.is_some() && (self.settings.show_raw || s.image.is_none()) {
                 items.push(Item { shot, raw: true });
             }
-            if s.jpg.is_some() {
+            if s.image.is_some() {
                 items.push(Item { shot, raw: false });
             }
         }
@@ -581,6 +602,7 @@ impl App {
                 continue;
             }
             let key = loaded.key;
+            let animation = loaded.animation;
             let (image, original) = match loaded.image {
                 Ok(v) => v,
                 Err(_) => {
@@ -592,7 +614,14 @@ impl App {
                 Kind::Full => {
                     let tex = ctx.load_texture(format!("full-{}", key.shot), image, TextureOptions::LINEAR);
                     let original = vec2(original[0] as f32, original[1] as f32);
-                    self.fulls.insert(key.shot, FullImage { tex, original });
+                    let frames = animation
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (img, delay))| {
+                            (ctx.load_texture(format!("frame-{}-{i}", key.shot), img, TextureOptions::LINEAR), delay)
+                        })
+                        .collect();
+                    self.fulls.insert(key.shot, FullImage { tex, original, frames });
                 }
                 Kind::Original => {
                     if key.shot == self.current && self.screen == Screen::Viewer {
@@ -718,9 +747,10 @@ impl App {
                 match self.screen {
                     Screen::Viewer if !self.shots.is_empty() => {
                         let shot = &self.shots[self.current];
-                        let (title, sub) = match (&shot.jpg, &shot.raw) {
-                            (Some(_), Some(_)) => (shot.jpg_name(), format!("Paired with {}", shot.raw_name())),
-                            (Some(_), None) => (shot.jpg_name(), "No RAW".into()),
+                        let (title, sub) = match (&shot.image, &shot.raw) {
+                            (Some(_), Some(_)) => (shot.image_name(), format!("Paired with {}", shot.raw_name())),
+                            (Some(_), None) if shot.is_camera_image() => (shot.image_name(), "No RAW".into()),
+                            (Some(_), None) => (shot.image_name(), format!("{} image", shot.image_kind())),
                             _ => (shot.raw_name(), "RAW only".into()),
                         };
                         painter.text(center - vec2(0.0, 7.0), Align2::CENTER_CENTER, title, theme::font_semibold(13.5), p.label);
@@ -911,8 +941,8 @@ impl App {
         for &s in shots {
             let shot = &self.shots[s];
             let files: Vec<&PathBuf> = match self.settings.drag_files {
-                DragFiles::Raw => shot.raw.as_ref().or(shot.jpg.as_ref()).into_iter().collect(),
-                DragFiles::Jpg => shot.jpg.as_ref().or(shot.raw.as_ref()).into_iter().collect(),
+                DragFiles::Raw => shot.raw.as_ref().or(shot.image.as_ref()).into_iter().collect(),
+                DragFiles::Jpg => shot.image.as_ref().or(shot.raw.as_ref()).into_iter().collect(),
                 DragFiles::Both => shot.files().collect(),
             };
             for file in files {
@@ -964,25 +994,35 @@ impl App {
     fn delete_dialog(&mut self, ctx: &egui::Context) {
         let Some(shots) = self.confirm_delete.clone() else { return };
         let p = self.p;
-        let jpgs = shots.iter().filter(|&&s| self.shots[s].jpg.is_some()).count();
+        let images: Vec<&Shot> = shots.iter().map(|&s| &self.shots[s]).filter(|s| s.image.is_some()).collect();
+        let jpgs = images.len();
         let raws = shots.iter().filter(|&&s| self.shots[s].raw.is_some()).count();
         let n = shots.len();
         let permanent = self.folder.as_deref().is_some_and(export::on_removable_drive);
+        // "JPG"/"PNG"/… when they're all one type, else "image".
+        let kind = match images.first().map(|s| s.image_kind()) {
+            Some(k) if images.iter().all(|s| s.image_kind() == k) => k,
+            _ => "image".to_string(),
+        };
+        let kinds = |count: usize| if count == 1 { kind.clone() } else { format!("{kind}s") };
 
         let title = if n == 1 { "Delete this photo?".to_string() } else { format!("Delete {n} photos?") };
         let what = match (jpgs, raws) {
             (0, r) => format!("This deletes {r} RAW {}.", plural(r, "file", "files")),
-            (j, 0) => format!("This deletes {j} {} (no RAW files).", plural(j, "JPG", "JPGs")),
+            (j, 0) if images.iter().all(|s| s.is_camera_image()) => {
+                format!("This deletes {j} {} (no RAW files).", kinds(j))
+            }
+            (j, 0) => format!("This deletes {j} {}.", kinds(j)),
             (j, r) if j == r => format!(
                 "This deletes {j} {} and {} {r} RAW {} ({} files).",
-                plural(j, "JPG", "JPGs"),
+                kinds(j),
                 if r == 1 { "its" } else { "their" },
                 plural(r, "file", "files"),
                 j + r
             ),
             (j, r) => format!(
                 "This deletes {j} {} and {r} RAW {} ({} files).",
-                plural(j, "JPG", "JPGs"),
+                kinds(j),
                 plural(r, "file", "files"),
                 j + r
             ),
@@ -1067,9 +1107,9 @@ impl App {
         let Some(dir) = self.folder.clone() else { return };
         let Ok(new_shots) = library::scan(&dir) else { return };
         let index: HashMap<String, usize> =
-            new_shots.iter().enumerate().map(|(i, s)| (s.name.to_lowercase(), i)).collect();
+            new_shots.iter().enumerate().map(|(i, s)| (s.key.clone(), i)).collect();
         let old = std::mem::replace(&mut self.shots, new_shots);
-        let remap = |i: usize| old.get(i).and_then(|s| index.get(&s.name.to_lowercase())).copied();
+        let remap = |i: usize| old.get(i).and_then(|s| index.get(&s.key)).copied();
 
         self.thumbs = std::mem::take(&mut self.thumbs).into_iter().filter_map(|(i, t)| Some((remap(i)?, t))).collect();
         self.picked = self.picked.iter().filter_map(|&i| remap(i)).collect();
@@ -1512,11 +1552,11 @@ impl App {
 
         // File type badge (top-left).
         let (badge, fg, bg) = if item.raw {
-            ("RAW", Color32::from_rgb(0x1D, 0x1D, 0x1F), Color32::from_white_alpha(235))
+            ("RAW".to_string(), Color32::from_rgb(0x1D, 0x1D, 0x1F), Color32::from_white_alpha(235))
         } else {
-            ("JPG", Color32::WHITE, Color32::from_black_alpha(140))
+            (shot.image_kind(), Color32::WHITE, Color32::from_black_alpha(140))
         };
-        let galley = painter.layout_no_wrap(badge.into(), theme::font_semibold(10.0), fg);
+        let galley = painter.layout_no_wrap(badge, theme::font_semibold(10.0), fg);
         let badge_rect = Rect::from_min_size(thumb_rect.min + vec2(8.0, 8.0), galley.size() + vec2(10.0, 4.0));
         painter.rect_filled(badge_rect, p.r_ctl.min(4), bg);
         painter.galley(badge_rect.min + vec2(5.0, 2.0), galley, fg);
@@ -1543,7 +1583,7 @@ impl App {
         }
 
         // File name, with a blue highlight when selected (like Finder).
-        let name = if item.raw { shot.raw_name() } else { shot.jpg_name() };
+        let name = if item.raw { shot.raw_name() } else { shot.image_name() };
         let name_color = if selected { p.on_accent } else { p.label };
         let g = painter.layout_no_wrap(name, theme::font(12.5), name_color);
         let name_rect = Rect::from_center_size(
@@ -1554,11 +1594,13 @@ impl App {
             painter.rect_filled(name_rect, p.r_ctl.min(5), p.accent);
         }
         painter.galley(name_rect.min + vec2(6.0, 1.0), g, name_color);
-        let sub = match (item.raw, shot.jpg.is_some(), shot.raw.is_some()) {
-            (true, true, _) => "Paired with JPG".to_string(),
+        let sub = match (item.raw, shot.image.is_some(), shot.raw.is_some()) {
+            (true, true, _) => format!("Paired with {}", shot.image_kind()),
             (true, false, _) => "No JPG".to_string(),
             (false, _, true) => format!("+ {}", shot.raw_kind()),
-            (false, _, false) => "No RAW".to_string(),
+            (false, _, false) if shot.is_camera_image() => "No RAW".to_string(),
+            // PNG, GIF, … never have a RAW; nothing to point out.
+            (false, _, false) => String::new(),
         };
         painter.text(pos2(thumb_rect.center().x, name_rect.max.y + 8.0), Align2::CENTER_CENTER, sub, theme::font(11.0), p.label2);
 
@@ -1654,9 +1696,14 @@ impl App {
 
                 // Sharpest available texture: all pixels once zoomed past the screen-sized copy.
                 let needs_original = self.zoom.is_some_and(|z| z * ppp * orig.x > full.tex.size_vec2().x * 1.05);
+                // GIFs play at their own frame timing; repaint when the next frame is due.
+                let (frame_tex, next_frame) = full.frame_at(ui.input(|i| i.time));
+                if let Some(wait) = next_frame {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait.max(0.005)));
+                }
                 let tex = match &self.original {
-                    Some((s, t)) if *s == shot && needs_original => t,
-                    _ => &full.tex,
+                    Some((s, t)) if *s == shot && needs_original && full.frames.is_empty() => t,
+                    _ => frame_tex,
                 };
                 let image_rect = Rect::from_min_size(area.center() - center * scale, orig * scale);
                 let radius = if self.zoom.is_some() { 0 } else { 4 };
@@ -1683,9 +1730,9 @@ impl App {
         if self.picked.contains(&shot) && self.zoom.is_none() {
             let painter = ui.painter();
             let s = &self.shots[shot];
-            let copied = match (s.jpg.is_some(), s.raw.is_some()) {
-                (true, true) => format!("JPG + {}", s.raw_kind()),
-                (true, false) => "JPG".to_string(),
+            let copied = match (s.image.is_some(), s.raw.is_some()) {
+                (true, true) => format!("{} + {}", s.image_kind(), s.raw_kind()),
+                (true, false) => s.image_kind(),
                 _ => s.raw_kind(),
             };
             let g = painter.layout_no_wrap(format!("Picked · {copied} copied"), theme::font(13.0), Color32::WHITE);
@@ -2455,7 +2502,8 @@ mod tests {
             app.shots = (0..60)
                 .map(|i| Shot {
                     name: format!("IMG_{i:04}"),
-                    jpg: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.JPG"))),
+                    key: format!("img_{i:04}"),
+                    image: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.JPG"))),
                     raw: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.CR3"))),
                 })
                 .collect();
@@ -2694,7 +2742,7 @@ mod tests {
         h.app.open_viewer(5);
         let image = egui::ColorImage::new([1200, 800], vec![Color32::GRAY; 1200 * 800]);
         let tex = h.ctx.load_texture("full", image, TextureOptions::LINEAR);
-        h.app.fulls.insert(5, FullImage { tex, original: vec2(6000.0, 4000.0) });
+        h.app.fulls.insert(5, FullImage { tex, original: vec2(6000.0, 4000.0), frames: Vec::new() });
         h.frame(vec![], 0.016);
         let pos = h.ctx.screen_rect().center();
 
@@ -2712,6 +2760,30 @@ mod tests {
         assert!(h.app.zoom.is_none(), "second double-click zooms back out");
         double_click(&mut h);
         assert!(h.app.zoom.is_some(), "third double-click zooms in again");
+    }
+
+    /// A GIF in the viewer shows the frame due at each moment, looping.
+    #[test]
+    fn gif_frames_follow_their_timing() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| {
+            ctx.load_texture(name, egui::ColorImage::new([2, 2], vec![Color32::GRAY; 4]), TextureOptions::LINEAR)
+        };
+        let full = FullImage {
+            tex: tex("still"),
+            original: vec2(2.0, 2.0),
+            frames: vec![(tex("a"), 0.1), (tex("b"), 0.2), (tex("c"), 0.3)],
+        };
+        let shown = |t: f64| {
+            let (tex, _) = full.frame_at(t);
+            full.frames.iter().position(|(f, _)| f.id() == tex.id()).unwrap()
+        };
+        assert_eq!(shown(0.05), 0);
+        assert_eq!(shown(0.15), 1);
+        assert_eq!(shown(0.45), 2);
+        assert_eq!(shown(0.65), 0, "loops after 0.6 s");
+        let (_, wait) = full.frame_at(0.15);
+        assert!((wait.unwrap() - 0.15).abs() < 1e-9, "next frame due in 0.15 s");
     }
 
     /// The mouse back button leaves the viewer, and closes Settings.

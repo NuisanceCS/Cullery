@@ -20,7 +20,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
-use image::{imageops, RgbImage};
+use image::{imageops, RgbImage, RgbaImage};
 
 use crate::raw;
 
@@ -55,7 +55,19 @@ pub struct Loaded {
     pub generation: u64,
     /// The decoded image and the photo's full size `[width, height]` (as displayed).
     pub image: Result<(ColorImage, [u32; 2]), String>,
+    /// For an animated GIF shown in the viewer: every frame and how long it shows
+    /// (seconds). Empty for still images.
+    pub animation: Vec<(ColorImage, f64)>,
 }
+
+/// Image types decoded by the `image` crate (PNG, GIF, WebP, TIFF, BMP).
+const IMAGE_CRATE_EXTENSIONS: &[&str] = &["png", "gif", "webp", "tif", "tiff", "bmp"];
+/// Image types decoded by Windows (HEIC/HEIF need the HEIF Image Extension, AVIF the
+/// AV1 Video Extension).
+const WINDOWS_DECODED_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
+/// Most memory an animated GIF's frames may take in the viewer; frames beyond it are
+/// dropped and the animation loops over the rest.
+const ANIMATION_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Default)]
 struct Queues {
@@ -170,16 +182,116 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
                 q = cvar.wait(q).unwrap();
             }
         };
-        let is_raw = request.path.extension().and_then(|e| e.to_str()).is_some_and(raw::is_raw_extension);
-        let image = match (is_raw, request.key.kind) {
-            (true, kind) => decode_raw(&request.path, kind, request.max),
-            (false, Kind::Preview) => decode_embedded_thumbnail(&request.path),
-            (false, _) => decode_file(&request.path, request.max),
+        let ext = request.path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let kind = request.key.kind;
+        let mut animation = Vec::new();
+        let image = if raw::is_raw_extension(&ext) {
+            decode_raw(&request.path, kind, request.max)
+        } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) || WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
+            match kind {
+                // No embedded thumbnail to grab quickly; the Thumb request decodes it.
+                Kind::Preview => Err("no embedded thumbnail".to_string()),
+                Kind::Full if ext == "gif" => decode_gif_animation(&request.path, request.max).map(|(first, frames)| {
+                    animation = frames;
+                    first
+                }),
+                _ if WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) => decode_with_windows(&request.path, request.max),
+                _ => decode_with_image_crate(&request.path, request.max),
+            }
+        } else if kind == Kind::Preview {
+            decode_embedded_thumbnail(&request.path)
+        } else {
+            decode_file(&request.path, request.max)
         };
-        if tx.send(Loaded { key: request.key, generation, image }).is_err() {
+        if tx.send(Loaded { key: request.key, generation, image, animation }).is_err() {
             return;
         }
         ctx.request_repaint();
+    }
+}
+
+/// Shrinks `img` to fit within `max` (never enlarges).
+fn fit_within(img: RgbaImage, max: [u32; 2]) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    if w <= max[0] && h <= max[1] {
+        return img;
+    }
+    let scale = (max[0] as f32 / w as f32).min(max[1] as f32 / h as f32);
+    let nw = ((w as f32 * scale).round() as u32).max(1);
+    let nh = ((h as f32 * scale).round() as u32).max(1);
+    imageops::resize(&img, nw, nh, imageops::FilterType::Triangle)
+}
+
+fn to_color_image(img: &RgbaImage) -> ColorImage {
+    ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw())
+}
+
+/// PNG, GIF (first frame), WebP, TIFF, BMP, turned upright per their orientation tag.
+fn decode_with_image_crate(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    use image::{DynamicImage, ImageDecoder, ImageReader};
+    let reader = ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    let original = [img.width(), img.height()];
+    let rgba = fit_within(img.into_rgba8(), max);
+    Ok((to_color_image(&rgba), original))
+}
+
+/// HEIC / HEIF / AVIF through Windows' own decoders.
+fn decode_with_windows(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    let d = crate::wic::decode(path, max)?;
+    let img = RgbaImage::from_raw(d.size[0], d.size[1], d.rgba).ok_or("pixel buffer size mismatch")?;
+    let img = orient(img, d.orientation);
+    Ok((to_color_image(&img), d.original))
+}
+
+/// Every frame of a GIF, sized to fit `max`, with how long each shows. Returns the
+/// first frame on its own too (for the still view and zoom), with the GIF's size.
+fn decode_gif_animation(path: &Path, max: [u32; 2]) -> Result<((ColorImage, [u32; 2]), Vec<(ColorImage, f64)>), String> {
+    use image::codecs::gif::GifDecoder;
+    use image::AnimationDecoder;
+    let file = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+    let decoder = GifDecoder::new(file).map_err(|e| e.to_string())?;
+    let mut frames = Vec::new();
+    let mut original = [0, 0];
+    let mut bytes = 0usize;
+    for frame in decoder.into_frames() {
+        let frame = frame.map_err(|e| e.to_string())?;
+        let (num, den) = frame.delay().numer_denom_ms();
+        // Browsers treat very short delays (0–10 ms) as 100 ms; so does Cullery.
+        let ms = if den == 0 { 100.0 } else { num as f64 / den as f64 };
+        let delay = if ms <= 10.0 { 0.1 } else { ms / 1000.0 };
+        let buffer = frame.into_buffer();
+        original = [buffer.width(), buffer.height()];
+        let img = to_color_image(&fit_within(buffer, max));
+        bytes += img.pixels.len() * 4;
+        frames.push((img, delay));
+        if bytes > ANIMATION_BYTES {
+            break;
+        }
+    }
+    let first = frames.first().ok_or("GIF has no frames")?.0.clone();
+    if frames.len() == 1 {
+        frames.clear(); // a still GIF
+    }
+    Ok(((first, original), frames))
+}
+
+/// Applies an EXIF orientation (1–8) so the image is upright.
+fn orient(img: RgbaImage, orientation: u32) -> RgbaImage {
+    match orientation {
+        2 => imageops::flip_horizontal(&img),
+        3 => imageops::rotate180(&img),
+        4 => imageops::flip_vertical(&img),
+        5 => imageops::flip_horizontal(&imageops::rotate90(&img)),
+        6 => imageops::rotate90(&img),
+        7 => imageops::flip_horizontal(&imageops::rotate270(&img)),
+        8 => imageops::rotate270(&img),
+        _ => img,
     }
 }
 
@@ -330,6 +442,57 @@ fn decode_jpeg(bytes: &[u8], max: [u32; 2], orientation: u32) -> Result<(ColorIm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cullery-fmt-{}-{name}", std::process::id()))
+    }
+
+    /// A 600×400 gradient, so scaled results are easy to check.
+    fn test_image() -> RgbaImage {
+        RgbaImage::from_fn(600, 400, |x, y| image::Rgba([(x / 3) as u8, (y / 2) as u8, 90, 255]))
+    }
+
+    /// PNG, WebP, TIFF and BMP decode, scaled to fit, reporting the full size.
+    #[test]
+    fn decodes_png_webp_tiff_bmp() {
+        for ext in ["png", "webp", "tiff", "bmp"] {
+            let path = temp(&format!("still.{ext}"));
+            test_image().save(&path).unwrap_or_else(|e| panic!("encoding {ext}: {e}"));
+            let decoded = decode_with_image_crate(&path, [300, 300]);
+            std::fs::remove_file(&path).unwrap();
+            let (img, original) = decoded.unwrap_or_else(|e| panic!("decoding {ext}: {e}"));
+            assert_eq!(original, [600, 400], "{ext}");
+            assert_eq!(img.size, [300, 200], "{ext}");
+        }
+    }
+
+    /// An animated GIF keeps every frame and its timing; a 0 ms delay plays as 100 ms.
+    #[test]
+    fn decodes_animated_gif_frames() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let path = temp("anim.gif");
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut encoder = GifEncoder::new(file);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for (i, ms) in [(0u8, 50u32), (1, 200), (2, 0)] {
+                let frame = RgbaImage::from_pixel(120, 80, image::Rgba([i * 100, 0, 0, 255]));
+                encoder.encode_frame(Frame::from_parts(frame, 0, 0, Delay::from_numer_denom_ms(ms, 1))).unwrap();
+            }
+        }
+        let decoded = decode_gif_animation(&path, [60, 60]);
+        // Its first frame alone, for the grid.
+        let still = decode_with_image_crate(&path, [400, 400]);
+        std::fs::remove_file(&path).unwrap();
+
+        let ((first, original), frames) = decoded.unwrap();
+        assert_eq!(original, [120, 80]);
+        assert_eq!(first.size, [60, 40]);
+        let delays: Vec<f64> = frames.iter().map(|(_, d)| (d * 1000.0).round()).collect();
+        assert_eq!(delays, [50.0, 200.0, 100.0]);
+        assert_eq!(still.unwrap().0.size, [120, 80]);
+    }
 
     /// Decodes real RAW files' embedded previews at each size, e.g.
     /// `$env:CULLERY_RAW_SAMPLES='F:\DCIM\100CANON'; cargo test --release raw_decode -- --nocapture`

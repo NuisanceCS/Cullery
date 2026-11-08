@@ -40,7 +40,10 @@ The built app is `target\release\cullery.exe`.
   un-picking moves those copies to the Recycle Bin. Picks are remembered per folder in
   `%APPDATA%\Cullery\picks\`.
 
-JPG and RAW are paired by file name (`IMG_4821.JPG` + `IMG_4821.CR3`).
+JPG and RAW are paired by file name (`IMG_4821.JPG` + `IMG_4821.CR3`); HEIC/HEIF pair the
+same way. PNG, GIF (animated in the viewer), WebP, TIFF and BMP show on their own.
+HEIC/HEIF (and AVIF) are decoded by Windows, which needs Microsoft's free HEIF Image
+Extensions (plus HEVC Video Extensions; AV1 Video Extension for AVIF) from the Store.
 Shots with only a RAW are shown using the JPEG previews the camera embeds in the file
 (no RAW processing): CR3 (thumbnail, 1620×1080 and full size), TIFF-based RAWs (CR2, NEF,
 ARW, DNG, ORF, RW2, PEF, SRW) and Fujifilm RAF.
