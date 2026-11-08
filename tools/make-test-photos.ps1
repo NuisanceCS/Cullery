@@ -1,4 +1,4 @@
-# Creates a folder of fake camera shots for trying Culler without an SD card:
+# Creates a folder of fake camera shots for trying Cullery without an SD card:
 # full-size (6000x4000) JPGs plus dummy .CR3 files with matching names.
 # A few shots are JPG-only or RAW-only to test pairing.
 #   powershell -ExecutionPolicy Bypass -File tools\make-test-photos.ps1 [-Count 40] [-Out test-photos]

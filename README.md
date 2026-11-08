@@ -1,6 +1,6 @@
-# Culler
+# Cullery
 
-A fast, simple photo culler for RAW + JPEG shoots (Canon CR3). Browse the JPGs; picking a
+*Cull + gallery.* A fast, simple photo culler for RAW + JPEG shoots (Canon CR3). Browse the JPGs; picking a
 shot copies its JPG **and** its matching CR3 to your export folder.
 
 ## Run
@@ -9,7 +9,7 @@ shot copies its JPG **and** its matching CR3 to your export folder.
 cargo run --release
 ```
 
-The built app is `target\release\culler.exe`.
+The built app is `target\release\cullery.exe`.
 
 ## Use
 
@@ -28,10 +28,10 @@ The built app is `target\release\culler.exe`.
   drag to move around. The zoom readout next to the arrows switches between Fit and 100%.
 - **Export folder:** the button in the top right. Picking copies the files right away;
   un-picking moves those copies to the Recycle Bin. Picks are remembered per folder in
-  `%APPDATA%\Culler\picks\`.
+  `%APPDATA%\Cullery\picks\`.
 
 JPG and RAW are paired by file name (`IMG_4821.JPG` + `IMG_4821.CR3`).
-Settings live in `%APPDATA%\Culler\settings.txt`.
+Settings live in `%APPDATA%\Cullery\settings.txt`.
 
 ## Test photos
 

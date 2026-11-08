@@ -224,7 +224,7 @@ impl App {
                 } else {
                     None
                 };
-                let title = format!("Culler — {}", folder_name(&dir));
+                let title = format!("Cullery — {}", folder_name(&dir));
                 ctx.send_viewport_cmd(ViewportCommand::Title(title));
                 self.settings.add_recent(dir.clone());
                 self.settings.save();
@@ -601,7 +601,7 @@ impl App {
                         painter.text(center + vec2(0.0, 10.0), Align2::CENTER_CENTER, sub, theme::font(11.0), p.label2);
                     }
                     _ if self.folder.is_none() => {
-                        painter.text(center, Align2::CENTER_CENTER, "Culler", theme::font_semibold(13.5), p.label2);
+                        painter.text(center, Align2::CENTER_CENTER, "Cullery", theme::font_semibold(13.5), p.label2);
                     }
                     _ => {}
                 }

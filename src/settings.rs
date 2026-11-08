@@ -1,7 +1,26 @@
 //! Remembers the export folder, recent folders and view options between runs,
-//! in a small text file under %APPDATA%\Culler.
+//! in a small text file under %APPDATA%\Cullery.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// `%APPDATA%\Cullery`, where settings and picks live.
+///
+/// The app was called Culler at first; the first run under the new name moves that
+/// folder over so settings, recent folders and picks carry across.
+pub fn data_dir() -> Option<PathBuf> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let base = PathBuf::from(std::env::var_os("APPDATA")?);
+        let dir = base.join("Cullery");
+        let old = base.join("Culler");
+        if !dir.exists() && old.is_dir() {
+            let _ = std::fs::rename(&old, &dir);
+        }
+        Some(dir)
+    })
+    .clone()
+}
 
 const MAX_RECENT: usize = 8;
 
@@ -19,8 +38,7 @@ impl Default for Settings {
 }
 
 fn file() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(base).join("Culler").join("settings.txt"))
+    Some(data_dir()?.join("settings.txt"))
 }
 
 impl Settings {

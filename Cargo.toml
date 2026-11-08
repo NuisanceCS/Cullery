@@ -1,5 +1,5 @@
 [package]
-name = "culler"
+name = "cullery"
 version = "0.1.0"
 edition = "2021"
 description = "Fast, simple photo culler for RAW+JPEG shoots"

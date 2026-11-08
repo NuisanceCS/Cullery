@@ -1,6 +1,6 @@
 //! Remembers which shots in a folder are picked, between runs.
 //!
-//! Picks are stored per source folder in %APPDATA%\Culler\picks\, as a list of shot
+//! Picks are stored per source folder in %APPDATA%\Cullery\picks\, as a list of shot
 //! names. They're kept apart from the export folder's contents so a Quick Export
 //! (copying without picking) doesn't count as a pick.
 
@@ -8,9 +8,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 fn file_for(folder: &Path) -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
     let key = folder.to_string_lossy().to_lowercase();
-    Some(PathBuf::from(base).join("Culler").join("picks").join(format!("{:016x}.txt", fnv1a(key.as_bytes()))))
+    Some(crate::settings::data_dir()?.join("picks").join(format!("{:016x}.txt", fnv1a(key.as_bytes()))))
 }
 
 /// Stable hash (unlike std's), so the same folder always maps to the same file.
@@ -33,7 +32,7 @@ pub fn save<'a>(folder: &Path, names: impl Iterator<Item = &'a str>) {
     let Some(path) = file_for(folder) else { return };
     let mut names: Vec<&str> = names.collect();
     names.sort_unstable();
-    let mut text = format!("# Culler picks for {}\n", folder.display());
+    let mut text = format!("# Cullery picks for {}\n", folder.display());
     for name in names {
         text += name;
         text.push('\n');

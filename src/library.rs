@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn pairs_jpg_and_raw_by_name() {
-        let dir = std::env::temp_dir().join(format!("culler-scan-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cullery-scan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for name in [
