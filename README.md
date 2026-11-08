@@ -21,6 +21,10 @@ The built app is `target\release\cullery.exe`.
   thumbnail's corner picks just that one. "JPG Only / JPG + RAW" (top bar) switches whether
   RAW files show as their own tiles. "Select Range" narrows the grid to one set of shots (click first, then last).
   The photo in the middle of the grid stays put when the layout changes.
+- **View Picked** (bottom right): show only picked photos; the viewer's arrows skip the rest.
+- **Drag out:** drag a photo (or a selection) from the grid into Lightroom, LightCraft, Explorer
+  or any app that takes dropped files; it arrives as one group. Settings → Drag & Drop picks
+  RAW (default), JPG or both. Copies already in the export folder are sent from there.
 - **Quick Export** (`Ctrl+E`): copies the selected photos (or the one in the viewer) to the
   export folder without marking them picked, then confirms at the bottom of the window.
 - **Viewer:** `←` / `→` previous / next, `P` or `Space` pick, `Esc` back to grid.

@@ -29,11 +29,50 @@ pub struct Settings {
     pub recent: Vec<PathBuf>,
     pub show_raw: bool,
     pub tile_width: f32,
+    pub drag_files: DragFiles,
+}
+
+/// Which of a shot's files go along when photos are dragged out of Cullery.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DragFiles {
+    /// The RAW (or the JPG, for shots without one). For editing in Lightroom / LightCraft.
+    Raw,
+    /// The JPG (or the RAW, for shots without one).
+    Jpg,
+    Both,
+}
+
+impl DragFiles {
+    pub const ALL: [DragFiles; 3] = [DragFiles::Raw, DragFiles::Jpg, DragFiles::Both];
+
+    fn key(self) -> &'static str {
+        match self {
+            DragFiles::Raw => "raw",
+            DragFiles::Jpg => "jpg",
+            DragFiles::Both => "both",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DragFiles::Raw => "RAW files",
+            DragFiles::Jpg => "JPG files",
+            DragFiles::Both => "JPG + RAW",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            DragFiles::Raw => "Best for editing in Lightroom or LightCraft. Shots without a RAW send their JPG.",
+            DragFiles::Jpg => "For sharing or quick edits. Shots without a JPG send their RAW.",
+            DragFiles::Both => "Every file of each shot.",
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { export_dir: None, recent: Vec::new(), show_raw: false, tile_width: 190.0 }
+        Self { export_dir: None, recent: Vec::new(), show_raw: false, tile_width: 190.0, drag_files: DragFiles::Raw }
     }
 }
 
@@ -53,6 +92,11 @@ impl Settings {
                 "export" if !value.is_empty() => s.export_dir = Some(PathBuf::from(value)),
                 "recent" if !value.is_empty() => s.recent.push(PathBuf::from(value)),
                 "show_raw" => s.show_raw = value == "1",
+                "drag_files" => {
+                    if let Some(d) = DragFiles::ALL.into_iter().find(|d| d.key() == value) {
+                        s.drag_files = d;
+                    }
+                }
                 "tile_width" => {
                     if let Ok(v) = value.parse::<f32>() {
                         s.tile_width = v.clamp(120.0, 360.0);
@@ -76,6 +120,7 @@ impl Settings {
         }
         text += &format!("show_raw={}\n", if self.show_raw { 1 } else { 0 });
         text += &format!("tile_width={}\n", self.tile_width.round());
+        text += &format!("drag_files={}\n", self.drag_files.key());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

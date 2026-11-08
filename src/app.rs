@@ -16,7 +16,7 @@ use crate::export::{Done, Exporter};
 use crate::library::{self, Shot};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
-use crate::settings::Settings;
+use crate::settings::{DragFiles, Settings};
 use crate::theme::{self, Palette};
 
 /// Grid thumbnails kept in memory; the least recently seen are dropped beyond this.
@@ -41,6 +41,7 @@ enum Screen {
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsPage {
     Keybinds,
+    DragDrop,
     Themes,
 }
 
@@ -52,6 +53,7 @@ const GRID_KEYS: &[(&str, &str)] = &[
     ("Ctrl + A", "Select all"),
     ("Double-click  /  Enter", "Open the photo"),
     ("P  /  Space", "Pick the selected photos (again to unpick)"),
+    ("Drag a photo", "Drag it (or the whole selection) into another app or folder"),
     ("Ctrl + E", "Quick Export the selected photos"),
     ("Esc", "Clear the selection, or cancel Select Range"),
     ("Ctrl + O", "Open a folder"),
@@ -83,6 +85,8 @@ struct Item {
 enum Action {
     /// Select (or, as the second of a double-click, open).
     Click(usize),
+    /// Started dragging this photo (and the rest of the selection, if it's in it).
+    DragOut(usize),
     TogglePick(usize),
     Mark(usize),
 }
@@ -125,6 +129,7 @@ struct ViewAnchor {
 struct LayoutKey {
     show_raw: bool,
     range_mode: bool,
+    view_picked: bool,
     range: Option<(usize, usize)>,
     tile_width: i32,
 }
@@ -161,6 +166,10 @@ pub struct App {
     double_click_time: f64,
     /// The settings window, and which page it shows.
     settings_page: Option<SettingsPage>,
+    /// Grid shows only picked photos.
+    view_picked: bool,
+    /// The app window, for starting drags out of it (None in tests).
+    hwnd: Option<isize>,
 
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
@@ -187,7 +196,13 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_context(&cc.egui_ctx)
+        let mut app = Self::with_context(&cc.egui_ctx);
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        app.hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+            _ => None,
+        });
+        app
     }
 
     fn with_context(ctx: &egui::Context) -> Self {
@@ -222,6 +237,8 @@ impl App {
             last_tile_click: None,
             double_click_time,
             settings_page: None,
+            view_picked: false,
+            hwnd: None,
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
@@ -430,21 +447,23 @@ impl App {
         self.zoom_percent = None;
     }
 
-    /// First and last shot index in the working set (all shots, or the selected range).
-    fn shown_range(&self) -> Option<(usize, usize)> {
-        if self.shots.is_empty() {
-            return None;
+    /// The shots in view, in order: picked ones (View Picked), the selected range,
+    /// or the whole folder. The grid, the viewer's arrows and the counts all use it.
+    fn working_set(&self) -> Vec<usize> {
+        if self.view_picked {
+            let mut picked: Vec<usize> = self.picked.iter().copied().collect();
+            picked.sort_unstable();
+            return picked;
         }
         match (self.range_mode, self.range) {
-            (RangeMode::Off, Some(r)) => Some(r),
-            _ => Some((0, self.shots.len() - 1)),
+            (RangeMode::Off, Some((from, to))) => (from..=to).collect(),
+            _ => (0..self.shots.len()).collect(),
         }
     }
 
     fn items(&self) -> Vec<Item> {
         let mut items = Vec::new();
-        let Some((from, to)) = self.shown_range() else { return items };
-        for shot in from..=to {
+        for shot in self.working_set() {
             let s = &self.shots[shot];
             if s.raw.is_some() && (self.settings.show_raw || s.jpg.is_none()) {
                 items.push(Item { shot, raw: true });
@@ -456,12 +475,30 @@ impl App {
         items
     }
 
+    /// Moves the viewer `delta` photos through the working set.
     fn step(&mut self, delta: isize) {
-        let Some((from, to)) = self.shown_range() else { return };
-        let next = (self.current as isize + delta).clamp(from as isize, to as isize) as usize;
+        let set = self.working_set();
+        if set.is_empty() {
+            return;
+        }
+        // Where the current photo is (or would be, if it just left the set, e.g. unpicked).
+        let pos = match set.binary_search(&self.current) {
+            Ok(i) => i as isize,
+            Err(i) => i as isize - if delta > 0 { 1 } else { 0 },
+        };
+        let next = set[(pos + delta).clamp(0, set.len() as isize - 1) as usize];
         if next != self.current {
             self.current = next;
             self.reset_zoom();
+        }
+    }
+
+    /// "3 of 120"-style position of the viewer's photo in the working set.
+    fn position_label(&self) -> String {
+        let set = self.working_set();
+        match set.binary_search(&self.current) {
+            Ok(i) => format!("{} of {}", i + 1, set.len()),
+            Err(_) => format!("– of {}", set.len()),
         }
     }
 
@@ -755,6 +792,9 @@ impl App {
         }
         if ui.add(range_btn).on_hover_text("Click the first and last shot of a set to work on just those").clicked() {
             self.range_mode = if selecting { RangeMode::Off } else { RangeMode::PickStart };
+            if !selecting {
+                self.view_picked = false;
+            }
         }
 
         ui.add_space(6.0);
@@ -784,9 +824,19 @@ impl App {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // View Picked (rightmost): show only picked photos.
+            let on = self.view_picked;
+            let mut b = Button::new(RichText::new("View Picked").color(if on { Color32::WHITE } else { p.label }));
+            if on {
+                b = b.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
+            }
+            let tip = if on { "Show the whole folder again" } else { "Show only picked photos, ready to drag into Lightroom or LightCraft" };
+            if ui.add(b).on_hover_text(tip).clicked() {
+                self.set_view_picked(!on);
+            }
             self.picked_badge(ui);
-            if let Some((from, to)) = self.shown_range() {
-                let mut text = format!("{} shots", to - from + 1);
+            if !self.shots.is_empty() {
+                let mut text = format!("{} shots", self.working_set().len());
                 if self.selected.len() > 1 {
                     text = format!("{} selected · {text}", self.selected.len());
                 }
@@ -794,6 +844,58 @@ impl App {
             }
             self.message_label(ui);
         });
+    }
+
+    /// Drags photos out of the window: the whole selection if `shot` is in it,
+    /// otherwise just `shot` (which becomes the selection, like Explorer).
+    fn drag_out(&mut self, shot: usize, items: &[Item]) {
+        if !self.selected.contains(&shot) {
+            self.click_select(shot, items, Modifiers::NONE);
+        }
+        let mut shots: Vec<usize> = self.selected.iter().copied().collect();
+        shots.sort_unstable();
+        let paths = self.drag_paths(&shots);
+        let Some(hwnd) = self.hwnd else { return };
+        if let Err(e) = crate::dragout::drag_files(hwnd, &paths) {
+            self.error(format!("Couldn't start the drag: {e}"));
+        }
+        self.last_tile_click = None;
+    }
+
+    /// The files to drag for these shots, per the Settings choice. A file already copied
+    /// to the export folder is dragged from there, so editors import from this computer
+    /// rather than the memory card.
+    fn drag_paths(&self, shots: &[usize]) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for &s in shots {
+            let shot = &self.shots[s];
+            let files: Vec<&PathBuf> = match self.settings.drag_files {
+                DragFiles::Raw => shot.raw.as_ref().or(shot.jpg.as_ref()).into_iter().collect(),
+                DragFiles::Jpg => shot.jpg.as_ref().or(shot.raw.as_ref()).into_iter().collect(),
+                DragFiles::Both => shot.files().collect(),
+            };
+            for file in files {
+                let copy = self
+                    .settings
+                    .export_dir
+                    .as_ref()
+                    .zip(file.file_name())
+                    .map(|(dir, name)| dir.join(name))
+                    .filter(|c| c.is_file());
+                paths.push(copy.unwrap_or_else(|| file.clone()));
+            }
+        }
+        paths
+    }
+
+    fn set_view_picked(&mut self, on: bool) {
+        self.view_picked = on;
+        if on {
+            self.range_mode = RangeMode::Off;
+            // Keep only selections that are still visible.
+            let picked = &self.picked;
+            self.selected.retain(|s| picked.contains(s));
+        }
     }
 
     fn picked_badge(&self, ui: &mut Ui) {
@@ -867,8 +969,8 @@ impl App {
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if let Some((from, to)) = self.shown_range() {
-                let text = format!("{} of {} · {} Picked", self.current - from + 1, to - from + 1, self.picked.len());
+            if !self.shots.is_empty() {
+                let text = format!("{} · {} Picked", self.position_label(), self.picked.len());
                 ui.label(RichText::new(text).color(p.label2));
             }
             self.message_label(ui);
@@ -948,7 +1050,7 @@ impl App {
     /// Returns the scroll view's rect, offset, content height and row height.
     fn grid_contents(&mut self, ui: &mut Ui) -> Option<(Rect, f32, f32, f32)> {
         let p = self.p;
-        if self.range_mode != RangeMode::Off || self.range.is_some() {
+        if self.view_picked || self.range_mode != RangeMode::Off || self.range.is_some() {
             self.range_banner(ui);
             ui.add_space(10.0);
         }
@@ -968,6 +1070,7 @@ impl App {
         let layout = LayoutKey {
             show_raw: self.settings.show_raw,
             range_mode: self.range_mode != RangeMode::Off,
+            view_picked: self.view_picked,
             range: self.range,
             tile_width: self.settings.tile_width.round() as i32,
         };
@@ -1077,6 +1180,7 @@ impl App {
                         self.last_tile_click = mods.is_none().then_some((shot, now));
                     }
                 }
+                Action::DragOut(shot) => self.drag_out(shot, &items),
                 Action::TogglePick(shot) => self.toggle_pick(shot),
                 Action::Mark(shot) => match self.range_mode {
                     RangeMode::PickEnd(start) => {
@@ -1093,6 +1197,17 @@ impl App {
     fn range_banner(&mut self, ui: &mut Ui) {
         let p = self.p;
         let (text, button) = match (self.range_mode, self.range) {
+            _ if self.view_picked => (
+                if self.picked.is_empty() {
+                    "No picked photos yet.".to_string()
+                } else {
+                    format!(
+                        "Showing your {} picked photos  ·  drag a selection into Lightroom, LightCraft or a folder",
+                        self.picked.len()
+                    )
+                },
+                "Show All",
+            ),
             (RangeMode::PickStart, _) => ("Click the first shot of this set.".to_string(), "Cancel"),
             (RangeMode::PickEnd(_), _) => ("Now click the last shot. Everything between becomes your working set.".to_string(), "Cancel"),
             (RangeMode::Off, Some((from, to))) => (
@@ -1119,7 +1234,9 @@ impl App {
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE);
                         if ui.add(b).clicked() {
-                            if self.range_mode != RangeMode::Off {
+                            if self.view_picked {
+                                self.view_picked = false;
+                            } else if self.range_mode != RangeMode::Off {
                                 self.range_mode = RangeMode::Off;
                             } else {
                                 self.range = None;
@@ -1132,7 +1249,9 @@ impl App {
 
     fn tile(&mut self, ui: &mut Ui, item: Item, w: f32, thumb_h: f32) -> (Option<Action>, Rect) {
         let p = self.p;
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, thumb_h + NAME_AREA), Sense::click());
+        // Tiles also sense drags, to drag photos out into other apps (not while picking a range).
+        let sense = if self.range_mode == RangeMode::Off { Sense::click_and_drag() } else { Sense::click() };
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, thumb_h + NAME_AREA), sense);
         if !ui.is_rect_visible(rect) {
             return (None, rect);
         }
@@ -1231,6 +1350,8 @@ impl App {
         // Double-clicks are spotted in grid_contents from two clicks in a row.
         let action = if selecting {
             resp.clicked().then_some(Action::Mark(item.shot))
+        } else if resp.drag_started() {
+            Some(Action::DragOut(item.shot))
         } else {
             resp.clicked().then_some(Action::Click(item.shot))
         };
@@ -1360,12 +1481,12 @@ impl App {
             }
         }
         let max = [(area.width() * ppp).max(800.0) as u32, (area.height() * ppp).max(600.0) as u32];
-        if let Some((from, to)) = self.shown_range() {
-            for s in [shot as isize, shot as isize + 1, shot as isize - 1, shot as isize + 2] {
-                if s < from as isize || s > to as isize {
-                    continue;
-                }
-                let s = s as usize;
+        let set = self.working_set();
+        let pos = set.binary_search(&shot).unwrap_or_else(|i| i) as isize;
+        {
+            for i in [pos, pos + 1, pos - 1, pos + 2] {
+                let Some(&s) = usize::try_from(i).ok().and_then(|i| set.get(i)) else { continue };
+                let s = if i == pos { shot } else { s };
                 let key = Key { shot: s, kind: Kind::Full };
                 if let Some(path) = self.shots[s].display_path() {
                     if !self.fulls.contains_key(&s) && !self.failed.contains(&key) {
@@ -1375,7 +1496,12 @@ impl App {
             }
         }
         self.loader.want_full(requests);
-        self.fulls.retain(|s, _| s.abs_diff(shot) <= 2);
+        let keep: HashSet<usize> = [pos - 2, pos - 1, pos, pos + 1, pos + 2]
+            .into_iter()
+            .filter_map(|i| usize::try_from(i).ok().and_then(|i| set.get(i)).copied())
+            .chain([shot])
+            .collect();
+        self.fulls.retain(|s, _| keep.contains(s));
         if self.original.as_ref().is_some_and(|(s, _)| *s != shot) {
             self.original = None;
         }
@@ -1494,9 +1620,8 @@ impl App {
                     }
                 }
                 if k.select_all {
-                    if let Some((from, to)) = self.shown_range() {
-                        self.selected.extend(from..=to);
-                    }
+                    let set = self.working_set();
+                    self.selected.extend(set);
                 }
                 if k.enter {
                     if let Some(shot) = self.select_anchor.filter(|s| self.selected.contains(s)) {
@@ -1554,7 +1679,12 @@ impl App {
                     // Sidebar.
                     ui.vertical(|ui| {
                         ui.set_width(140.0);
-                        for (target, label) in [(SettingsPage::Keybinds, "Keybinds"), (SettingsPage::Themes, "Themes")] {
+                        let pages = [
+                            (SettingsPage::Keybinds, "Keybinds"),
+                            (SettingsPage::DragDrop, "Drag & Drop"),
+                            (SettingsPage::Themes, "Themes"),
+                        ];
+                        for (target, label) in pages {
                             let on = page == target;
                             let b = Button::new(RichText::new(label).color(if on { Color32::WHITE } else { p.label }))
                                 .fill(if on { p.accent } else { Color32::TRANSPARENT })
@@ -1571,6 +1701,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.vertical(|ui| match page {
                         SettingsPage::Keybinds => keybinds_page(ui, &p),
+                        SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
                         SettingsPage::Themes => themes_page(ui, &p),
                     });
                 });
@@ -1596,6 +1727,35 @@ fn keybinds_page(ui: &mut Ui, p: &Palette) {
         }
         ui.label(RichText::new("Changing keybinds is coming soon.").color(p.label2).italics());
     });
+}
+
+fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
+    ui.label(RichText::new("Dragging photos out").font(theme::font_semibold(13.5)).color(p.label2));
+    ui.label(
+        RichText::new("Drag photos from the grid into Lightroom, LightCraft or a folder. A selection drags as one group.")
+            .color(p.label2),
+    );
+    ui.add_space(10.0);
+    ui.label(RichText::new("Files to send").font(theme::font_semibold(13.5)));
+    ui.add_space(4.0);
+    for choice in DragFiles::ALL {
+        let on = settings.drag_files == choice;
+        let r = ui.radio(on, RichText::new(choice.label()).font(theme::font_semibold(13.5)));
+        ui.indent(choice.label(), |ui| {
+            ui.label(RichText::new(choice.description()).color(p.label2));
+        });
+        if r.clicked() && !on {
+            settings.drag_files = choice;
+            settings.save();
+        }
+        ui.add_space(4.0);
+    }
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new("Photos already copied to your export folder are sent from there, not from the memory card.")
+            .color(p.label2)
+            .italics(),
+    );
 }
 
 fn themes_page(ui: &mut Ui, p: &Palette) {
@@ -2019,6 +2179,77 @@ mod tests {
             h.frame(vec![Harness::button(pos, false)], pause);
             assert!(h.double_click(pos, 0.2), "pause {pause}");
         }
+    }
+
+    /// View Picked: only picked photos in the grid, and the viewer's arrows skip the rest.
+    #[test]
+    fn view_picked_shows_and_steps_through_picks_only() {
+        let mut h = Harness::new();
+        h.app.picked = [2, 5, 9].into_iter().collect();
+        h.app.set_view_picked(true);
+        h.frame(vec![], 0.016);
+        let shown: Vec<usize> = h.app.drawn_tiles.iter().map(|(it, _)| it.shot).collect();
+        assert_eq!(shown, vec![2, 5, 9]);
+
+        h.app.open_viewer(5);
+        h.app.step(1);
+        assert_eq!(h.app.current, 9);
+        h.app.step(1);
+        assert_eq!(h.app.current, 9, "stops at the last pick");
+        h.app.step(-2);
+        assert_eq!(h.app.current, 2);
+        assert_eq!(h.app.position_label(), "1 of 3");
+
+        // Unpicked while viewing: the arrows carry on from where it was.
+        h.app.current = 5;
+        h.app.picked.remove(&5);
+        h.app.step(1);
+        assert_eq!(h.app.current, 9);
+    }
+
+    /// Drags send the chosen file type, from the export folder when a copy is there.
+    #[test]
+    fn drag_paths_follow_setting_and_prefer_export_copies() {
+        let mut h = Harness::new();
+        let export = std::env::temp_dir().join(format!("cullery-drag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("IMG_0003.CR3"), b"x").unwrap();
+        h.app.settings.export_dir = Some(export.clone());
+
+        h.app.settings.drag_files = DragFiles::Raw;
+        let paths = h.app.drag_paths(&[3, 4]);
+        assert_eq!(paths, vec![export.join("IMG_0003.CR3"), PathBuf::from(r"Z:\cullery-test\IMG_0004.CR3")]);
+
+        h.app.settings.drag_files = DragFiles::Jpg;
+        assert_eq!(h.app.drag_paths(&[4]), vec![PathBuf::from(r"Z:\cullery-test\IMG_0004.JPG")]);
+
+        h.app.settings.drag_files = DragFiles::Both;
+        assert_eq!(h.app.drag_paths(&[4]).len(), 2);
+
+        // A shot with no RAW sends its JPG even in RAW mode.
+        h.app.shots[4].raw = None;
+        h.app.settings.drag_files = DragFiles::Raw;
+        assert_eq!(h.app.drag_paths(&[4]), vec![PathBuf::from(r"Z:\cullery-test\IMG_0004.JPG")]);
+
+        std::fs::remove_dir_all(&export).unwrap();
+    }
+
+    /// Pressing on a photo and moving starts a drag of it (selecting it, like
+    /// Explorer); a selected photo drags the whole selection along.
+    #[test]
+    fn pressing_and_moving_starts_a_drag() {
+        let mut h = Harness::new();
+        h.app.selected = [1, 2].into_iter().collect();
+        let pos = thumb_center(h.tile(7));
+        h.frame(vec![Event::PointerMoved(pos)], 0.016);
+        h.frame(vec![Harness::button(pos, true)], 0.016);
+        for step in 1..=4 {
+            h.frame(vec![Event::PointerMoved(pos + vec2(8.0 * step as f32, 0.0))], 0.016);
+        }
+        // Outside a real window the drag itself can't start, but the selection shows
+        // which photos it would carry: the one under the pointer, as it wasn't selected.
+        assert_eq!(h.app.selected, [h.app.drawn_tiles[7].0.shot].into_iter().collect());
+        assert!(h.app.screen == Screen::Grid);
     }
 
     /// Esc closes Settings and nothing else: the grid selection behind it stays.

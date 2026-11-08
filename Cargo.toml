@@ -11,6 +11,18 @@ jpeg-decoder = "0.3"
 kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false }
 trash = "5"
+raw-window-handle = "0.6"
+
+# Dragging photos out of the window into other apps uses the Windows shell.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # Image decoding is painfully slow without optimizations, even while developing.
 [profile.dev.package."*"]

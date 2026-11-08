@@ -3,6 +3,7 @@
 
 mod app;
 mod devices;
+mod dragout;
 mod export;
 mod library;
 mod loader;

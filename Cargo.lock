@@ -715,8 +715,10 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "kamadak-exif",
+ "raw-window-handle",
  "rfd",
  "trash",
+ "windows 0.61.3",
 ]
 
 [[package]]
