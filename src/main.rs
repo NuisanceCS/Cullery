@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod args;
 mod devices;
 mod dragimage;
 mod dragout;
@@ -32,5 +33,6 @@ fn main() -> eframe::Result {
             ),
         ..Default::default()
     };
-    eframe::run_native("Cullery", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    let start = args::StartArgs::parse(std::env::args_os().skip(1));
+    eframe::run_native("Cullery", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, start)))))
 }

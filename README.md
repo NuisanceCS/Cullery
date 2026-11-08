@@ -9,7 +9,15 @@ shot copies its JPG **and** its matching CR3 to your export folder.
 cargo run --release
 ```
 
-The built app is `target\release\cullery.exe`.
+The built app is `target\release\cullery.exe`. It can start on something specific:
+
+```
+cullery.exe "F:\DCIM\100CANON"           open a folder
+cullery.exe "F:\DCIM\100CANON\IMG_1.JPG" open a photo in the viewer
+cullery.exe --theme win10-dark           use a theme for this run only
+```
+
+Themes: `apple-dark`, `apple-light`, `win11-dark`, `win11-light`, `win10-dark`, `win10-light`.
 
 ## Use
 
@@ -18,8 +26,10 @@ The built app is `target\release\cullery.exe`.
 - **Grid:** click to select (`Ctrl`+click adds/removes, `Shift`+click selects a run,
   `Ctrl+A` all, `Esc` clears); double-click or `Enter` opens a photo. `P` / `Space` or the
   Pick button picks everything selected (or unpicks, if all are picked). The circle in a
-  thumbnail's corner picks just that one. "JPG Only / JPG + RAW" (top bar) switches whether
-  RAW files show as their own tiles. "Select Range" narrows the grid to one set of shots (click first, then last).
+  thumbnail's corner picks just that one. "Show Paired RAW" (top bar) gives each pair's RAW
+  file its own tile; RAWs with no partner always show, and the button is hidden when nothing
+  has a RAW partner. "Sort" orders the grid by name, date
+  modified, type or size, ascending or descending. "Select Range" narrows the grid to one set of shots (click first, then last).
   The photo in the middle of the grid stays put when the layout changes.
 - **View Picked** (bottom right): show only picked photos; the viewer's arrows skip the rest.
 - **Drag out:** drag a photo (or a selection) from the grid into Lightroom, LightCraft, Explorer
@@ -30,7 +40,7 @@ The built app is `target\release\cullery.exe`.
 - **Delete** (trash button, or the `Delete` key): asks first, then deletes the selected
   photos (or the one in the viewer) with their RAW files — to the Recycle Bin, or
   permanently from a memory card or network drive (which have no Recycle Bin; the dialog
-  says so).
+  says so). Big deletes show a progress bar and the window stays responsive.
   Export-folder copies are kept.
 - **Themes** (Settings → Themes): Apple, Windows 11 (with the Mica wallpaper-tinted top bar,
   on Windows 11 22H2+) and Windows 10, each in dark and light.

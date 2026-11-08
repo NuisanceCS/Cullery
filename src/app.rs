@@ -13,7 +13,7 @@ use eframe::egui::{
 
 use crate::devices::{self, CardFolder};
 use crate::export::{self, Done, Exporter};
-use crate::library::{self, Shot};
+use crate::library::{self, Shot, SortBy};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
 use crate::settings::{DragFiles, Settings};
@@ -93,6 +93,17 @@ struct Item {
     shot: usize,
     raw: bool,
 }
+
+/// A delete in progress and what to do when it ends.
+struct Deleting {
+    job: export::Deletion,
+    shots: Vec<usize>,
+    permanent: bool,
+    started: f64,
+}
+
+/// How long a delete runs before its progress bar appears, in seconds.
+const DELETE_BAR_DELAY: f64 = 0.2;
 
 /// A drag out of the window: its files and the overlay's text. `shown` once the overlay
 /// has been drawn, so the drag can start.
@@ -183,6 +194,8 @@ struct LayoutKey {
 pub struct App {
     p: Palette,
     settings: Settings,
+    /// The theme on screen: the saved one, unless `--theme` chose another for this run.
+    theme_shown: ThemeId,
     /// The Windows 11 Mica backdrop is showing (the top bar is see-through to it).
     mica_active: bool,
     loader: Loader,
@@ -214,6 +227,8 @@ pub struct App {
     last_viewer_click: Option<(f64, Pos2)>,
     /// Shots waiting for the user to confirm deleting them.
     confirm_delete: Option<Vec<usize>>,
+    /// A delete running in the background.
+    deleting: Option<Deleting>,
     /// Longest gap between the clicks of a double-click, from Windows' setting.
     double_click_time: f64,
     /// The settings window, and which page it shows.
@@ -222,6 +237,8 @@ pub struct App {
     view_picked: bool,
     /// The app window, for starting drags out of it (None in tests).
     hwnd: Option<isize>,
+    /// Some photo in this folder has a RAW partner (else Show Paired RAW is hidden).
+    has_raw_pairs: bool,
     /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
     last_drag: HashSet<PathBuf>,
     /// A drag out of the window about to start, shown by its overlay first.
@@ -252,7 +269,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, start: crate::args::StartArgs) -> Self {
         let mut app = Self::with_context(&cc.egui_ctx);
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         app.hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
@@ -262,18 +279,58 @@ impl App {
         if let Some(hwnd) = app.hwnd {
             crate::window::set_icons(hwnd);
         }
-        let theme = app.settings.theme;
-        app.set_theme(&cc.egui_ctx, theme);
+        let theme = start.theme.unwrap_or(app.settings.theme);
+        app.show_theme(&cc.egui_ctx, theme);
+        if let Some(path) = start.path {
+            app.open_path(&cc.egui_ctx, path);
+        }
+        if let Some(problem) = start.problem {
+            app.error(problem);
+        }
         app
     }
 
-    /// Switches theme: colors and shapes, the title bar's light/dark mode, and the
-    /// Windows 11 Mica backdrop.
+    /// Opens what the command line named: a folder, or a photo in its folder's viewer.
+    fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
+        // A relative path means relative to where Cullery was started from.
+        let path = std::path::absolute(&path).unwrap_or(path);
+        if path.is_dir() {
+            self.open_folder(ctx, path);
+        } else if !path.is_file() {
+            self.error(format!("Couldn't find {}", path.display()));
+        } else if let Some(folder) = path.parent().map(Path::to_path_buf) {
+            self.open_folder(ctx, folder);
+            if self.folder.is_some() {
+                self.show_file(&path);
+            }
+        }
+    }
+
+    /// Opens the viewer at this file of the open folder.
+    fn show_file(&mut self, path: &Path) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let found = self.shots.iter().position(|s| {
+            s.files().any(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == name))
+        });
+        match found {
+            Some(shot) => self.open_viewer(shot),
+            None => self.error(format!("{} isn't a photo Cullery can open", path.display())),
+        }
+    }
+
+    /// Switches theme for good, from Settings.
     fn set_theme(&mut self, ctx: &egui::Context, id: ThemeId) {
         if self.settings.theme != id {
             self.settings.theme = id;
             self.settings.save();
         }
+        self.show_theme(ctx, id);
+    }
+
+    /// Shows a theme: colors and shapes, the title bar's light/dark mode, and the
+    /// Windows 11 Mica backdrop.
+    fn show_theme(&mut self, ctx: &egui::Context, id: ThemeId) {
+        self.theme_shown = id;
         self.p = id.palette();
         theme::apply(ctx, &self.p);
         self.mica_active = match self.hwnd {
@@ -294,6 +351,7 @@ impl App {
         let ctx = ctx.clone();
         Self {
             p,
+            theme_shown: settings.theme,
             settings,
             mica_active: false,
             loader: Loader::new(ctx.clone()),
@@ -317,10 +375,12 @@ impl App {
             last_tile_click: None,
             last_viewer_click: None,
             confirm_delete: None,
+            deleting: None,
             double_click_time,
             settings_page: None,
             view_picked: false,
             hwnd: None,
+            has_raw_pairs: false,
             last_drag: HashSet::new(),
             pending_drag: None,
             thumbs: HashMap::new(),
@@ -354,19 +414,21 @@ impl App {
 
     fn open_folder(&mut self, ctx: &egui::Context, dir: PathBuf) {
         match library::scan(&dir) {
-            Ok(shots) => {
+            Ok(mut shots) => {
+                library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
                 self.generation = self.loader.reset();
                 self.thumbs.clear();
                 self.fulls.clear();
                 self.original = None;
                 self.failed.clear();
+                self.has_raw_pairs = has_raw_pairs(&shots);
                 self.shots = shots;
                 self.reset_view();
                 // The memory card list is only on the start screen, which never comes
                 // back once a folder is open; dropping this stops its background scans.
                 self.cards = Arc::default();
                 self.message = if self.shots.is_empty() {
-                    Some(("No JPG or RAW files in this folder".into(), false))
+                    Some(("No photos in this folder".into(), false))
                 } else {
                     None
                 };
@@ -752,12 +814,21 @@ impl App {
                         }
                         self.recent_menu(ui, ctx);
                         if self.folder.is_some() {
-                            ui.add_space(14.0);
-                            let choice = segmented(ui, &p, &["JPG Only", "JPG + RAW"], self.settings.show_raw as usize);
-                            if let Some(i) = choice {
-                                self.settings.show_raw = i == 1;
-                                self.settings.save();
+                            if self.has_raw_pairs {
+                                ui.add_space(14.0);
+                                let on = self.settings.show_raw;
+                                let mut b = Button::new(RichText::new("Show Paired RAW").color(if on { p.on_accent } else { p.label }));
+                                if on {
+                                    b = b.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
+                                }
+                                let tip = "Give the RAW file of each pair its own tile. RAWs with nothing to pair with always show.";
+                                if ui.add(b).on_hover_text(tip).clicked() {
+                                    self.settings.show_raw = !on;
+                                    self.settings.save();
+                                }
                             }
+                            ui.add_space(8.0);
+                            self.sort_menu(ui);
                         }
                     }
 
@@ -819,6 +890,50 @@ impl App {
         }
     }
 
+    /// "Sort: Name", with the same choices as File Explorer's Sort by menu.
+    fn sort_menu(&mut self, ui: &mut Ui) {
+        let p = self.p;
+        let (by, descending) = (self.settings.sort_by, self.settings.sort_descending);
+        let mut chosen = None;
+        let title = format!("Sort: {}     ", by.label());
+        let menu = ui.menu_button(RichText::new(title).color(p.label), |ui| {
+            ui.set_min_width(130.0);
+            for option in SortBy::ALL {
+                if ui.radio(option == by, option.label()).clicked() {
+                    chosen = Some((option, descending));
+                    ui.close();
+                }
+            }
+            ui.separator();
+            for (label, direction) in [("Ascending", false), ("Descending", true)] {
+                if ui.radio(direction == descending, label).clicked() {
+                    chosen = Some((by, direction));
+                    ui.close();
+                }
+            }
+        });
+        let r = menu.response.rect;
+        chevron_down(ui.painter(), pos2(r.max.x - 16.0, r.center().y), 4.0, p.label2);
+        if let Some((new_by, new_descending)) = chosen.filter(|c| *c != (by, descending)) {
+            self.settings.sort_by = new_by;
+            self.settings.sort_descending = new_descending;
+            self.settings.save();
+            self.resort();
+        }
+    }
+
+    /// Puts the open folder in the chosen order, keeping picks, selection and
+    /// thumbnails with their photos. A range is a run of neighbours, so it ends here.
+    fn resort(&mut self) {
+        let mut sorted = self.shots.clone();
+        library::sort(&mut sorted, self.settings.sort_by, self.settings.sort_descending);
+        self.range = None;
+        self.range_mode = RangeMode::Off;
+        self.adopt_shots(sorted);
+        self.view_anchor = None;
+        self.pending_scroll = Some(0.0);
+    }
+
     fn export_button(&mut self, ui: &mut Ui) {
         let p = self.p;
         let mut job = LayoutJob::default();
@@ -853,7 +968,11 @@ impl App {
                     ui.set_min_height(44.0);
                     if self.folder.is_none() {
                         let center = ui.max_rect().center();
-                        ui.painter().text(center, Align2::CENTER_CENTER, "Open a folder to start", theme::font(13.5), p.label2);
+                        let (text, color) = match &self.message {
+                            Some((text, true)) => (text.as_str(), p.danger),
+                            _ => ("Open a folder to start", p.label2),
+                        };
+                        ui.painter().text(center, Align2::CENTER_CENTER, text, theme::font(13.5), color);
                         return;
                     }
                     match self.screen {
@@ -1024,7 +1143,7 @@ impl App {
     /// out of Cullery that land back on it are ignored.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if dropped.is_empty() {
+        if dropped.is_empty() || self.deleting.is_some() {
             return;
         }
         if dropped.iter().all(|p| self.last_drag.contains(p)) {
@@ -1132,10 +1251,19 @@ impl App {
         }
     }
 
-    /// Deletes these shots' files, then refreshes the folder without losing the view.
+    /// Starts deleting these shots' files in the background. `finish_delete` takes over
+    /// when they're gone.
     fn delete_shots(&mut self, ctx: &egui::Context, shots: &[usize], permanent: bool) {
         let files: Vec<PathBuf> = shots.iter().flat_map(|&s| self.shots[s].files().cloned()).collect();
-        let result = export::delete_files(&files, permanent);
+        let job = export::Deletion::start(files, permanent, ctx.clone());
+        self.deleting = Some(Deleting { job, shots: shots.to_vec(), permanent, started: ctx.input(|i| i.time) });
+    }
+
+    /// Once a delete has ended: refreshes the folder without losing the view.
+    fn finish_delete(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.deleting.as_ref().and_then(|d| d.job.try_finish()) else { return };
+        let Some(Deleting { shots, permanent, .. }) = self.deleting.take() else { return };
+        let shots = &shots[..];
 
         // In the viewer, move on to the next photo that's staying (or the one before).
         if self.screen == Screen::Viewer {
@@ -1161,13 +1289,54 @@ impl App {
         }
     }
 
+    /// A progress bar over the window while a delete runs. It also holds the mouse off
+    /// everything else, since photo numbers change when the delete ends.
+    fn delete_progress(&self, ctx: &egui::Context) {
+        let Some(d) = &self.deleting else { return };
+        let p = self.p;
+        let (done, total) = d.job.progress();
+        let n = d.shots.len();
+        // Small deletes are over before a bar would be readable; don't flash one.
+        let show = ctx.input(|i| i.time) - d.started >= DELETE_BAR_DELAY;
+        let frame = if show {
+            Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(20))
+        } else {
+            Frame::new()
+        };
+        let mut modal = egui::Modal::new(Id::new("deleting")).frame(frame);
+        if !show {
+            modal = modal.backdrop_color(Color32::TRANSPARENT);
+        }
+        modal.show(ctx, |ui| {
+            if !show {
+                return;
+            }
+            ui.set_width(400.0);
+            ui.label(RichText::new(format!("Deleting {n} {}…", plural(n, "photo", "photos"))).font(theme::font_semibold(17.0)));
+            ui.add_space(12.0);
+            ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(400.0).fill(p.accent).corner_radius(p.r_pill));
+            ui.add_space(8.0);
+            let place = if d.permanent { "Deleting permanently" } else { "Moving to the Recycle Bin" };
+            ui.label(RichText::new(format!("{place}: {done} of {total} files")).color(p.label2));
+        });
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     /// Rescans the open folder after files changed, keeping thumbnails, picks,
     /// selection, the viewed photo and the range (all matched up by shot name).
     fn refresh_folder(&mut self) {
         let Some(dir) = self.folder.clone() else { return };
-        let Ok(new_shots) = library::scan(&dir) else { return };
+        let Ok(mut new_shots) = library::scan(&dir) else { return };
+        library::sort(&mut new_shots, self.settings.sort_by, self.settings.sort_descending);
+        self.adopt_shots(new_shots);
+    }
+
+    /// Switches to a new list of the folder's shots, matching everything that refers
+    /// to a shot's position up with its new one.
+    fn adopt_shots(&mut self, new_shots: Vec<Shot>) {
         let index: HashMap<String, usize> =
             new_shots.iter().enumerate().map(|(i, s)| (s.key.clone(), i)).collect();
+        self.has_raw_pairs = has_raw_pairs(&new_shots);
         let old = std::mem::replace(&mut self.shots, new_shots);
         let remap = |i: usize| old.get(i).and_then(|s| index.get(&s.key)).copied();
 
@@ -1197,7 +1366,7 @@ impl App {
         self.reset_zoom();
         self.save_picks();
         if self.shots.is_empty() {
-            self.message = Some(("No JPG or RAW files left in this folder".into(), false));
+            self.message = Some(("No photos left in this folder".into(), false));
         }
     }
 
@@ -1667,7 +1836,7 @@ impl App {
         painter.galley(name_rect.min + vec2(6.0, 1.0), g, name_color);
         let sub = match (item.raw, shot.image.is_some(), shot.raw.is_some()) {
             (true, true, _) => format!("Paired with {}", shot.image_kind()),
-            (true, false, _) => "No JPG".to_string(),
+            (true, false, _) => "RAW only".to_string(),
             (false, _, true) => format!("+ {}", shot.raw_kind()),
             (false, _, false) if shot.is_camera_image() => "No RAW".to_string(),
             // PNG, GIF, … never have a RAW; nothing to point out.
@@ -1913,6 +2082,7 @@ impl App {
     fn frame_ui(&mut self, ctx: &egui::Context) {
         self.frame += 1;
         self.receive(ctx);
+        self.finish_delete(ctx);
 
         self.handle_drops(ctx);
         self.start_pending_drag(ctx);
@@ -1949,8 +2119,9 @@ impl App {
             delete: i.key_pressed(KeyCode::Delete),
             settings: i.modifiers.command && i.key_pressed(KeyCode::Comma),
         });
-        // While the delete confirmation is up, it gets the keys (Esc cancels it).
-        if self.confirm_delete.is_some() {
+        // While the delete confirmation is up, it gets the keys (Esc cancels it); while
+        // a delete runs, nothing should touch the photos.
+        if self.confirm_delete.is_some() || self.deleting.is_some() {
             k = Keys::default();
         }
         // Ctrl + , opens or closes Settings, as in many Windows apps.
@@ -2048,6 +2219,7 @@ impl App {
         self.content_rect = panel.response.rect;
         self.settings_window(ctx);
         self.delete_dialog(ctx);
+        self.delete_progress(ctx);
         self.draw_toast(ctx);
         self.draw_drop_overlay(ctx);
         self.draw_drag_out_overlay(ctx);
@@ -2121,7 +2293,7 @@ impl App {
                             SettingsPage::Keybinds => keybinds_page(ui, &p),
                             SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
                             SettingsPage::ExportOnPick => export_action = export_page(ui, &p, &mut self.settings),
-                            SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.settings.theme),
+                            SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.theme_shown),
                         });
                     });
                 });
@@ -2419,20 +2591,31 @@ fn center_card(painter: &egui::Painter, center: Pos2, p: &Palette, lines: Vec<Ar
     }
 }
 
+/// Whether any photo here has a RAW partner; without one, Show Paired RAW does nothing.
+fn has_raw_pairs(shots: &[Shot]) -> bool {
+    shots.iter().any(|s| s.image.is_some() && s.raw.is_some())
+}
+
 /// The drag-out overlay's text: (title, how many photos, which files go).
 fn drag_out_hint(shots: &[&Shot], choice: DragFiles) -> (String, String, String) {
     let n = shots.len();
     let count = format!("{n} {}", plural(n, "photo", "photos"));
     let with_raw = shots.iter().filter(|s| s.raw.is_some()).count();
     let with_image = shots.iter().filter(|s| s.image.is_some()).count();
+    // The images' type when they're all one ("JPG", "PNG"), else just "image".
+    let mut kinds = shots.iter().filter(|s| s.image.is_some()).map(|s| s.image_kind());
+    let kind = kinds.next().filter(|first| kinds.all(|k| k == *first));
+    let image = kind.clone().unwrap_or_else(|| "image".to_string());
     let note = match choice {
         DragFiles::Raw if with_raw == n => "Only the RAW files will be sent".to_string(),
-        DragFiles::Raw if with_raw == 0 => "No RAW files, so the JPGs will be sent".to_string(),
-        DragFiles::Raw => "Only the RAW files will be sent (JPGs for photos without one)".to_string(),
-        DragFiles::Jpg if with_image == n => "Only the JPG files will be sent".to_string(),
-        DragFiles::Jpg if with_image == 0 => "No JPG files, so the RAWs will be sent".to_string(),
-        DragFiles::Jpg => "Only the JPG files will be sent (RAWs for photos without one)".to_string(),
-        DragFiles::Both => "JPG + RAW files will be sent".to_string(),
+        DragFiles::Raw if with_raw == 0 => format!("No RAW files, so the {image}s will be sent"),
+        DragFiles::Raw => format!("Only the RAW files will be sent ({image}s for photos without one)"),
+        DragFiles::Jpg if with_image == n => format!("Only the {image} files will be sent"),
+        DragFiles::Jpg if with_image == 0 => "No image files, so the RAWs will be sent".to_string(),
+        DragFiles::Jpg => format!("Only the {image} files will be sent (RAWs for photos without one)"),
+        DragFiles::Both if with_raw == 0 => format!("The {image} files will be sent"),
+        DragFiles::Both if with_image == 0 => "The RAW files will be sent".to_string(),
+        DragFiles::Both => format!("{} + RAW files will be sent", kind.as_deref().unwrap_or("Image")),
     };
     ("Drop into a folder or Lightroom".to_string(), count, note)
 }
@@ -2711,30 +2894,6 @@ fn size_icon(ui: &mut Ui, p: &Palette, s: f32) {
     ui.painter().rect_stroke(r, 2, Stroke::new(1.4_f32, p.label2), StrokeKind::Inside);
 }
 
-/// macOS-style segmented control. Returns the index clicked, if any.
-fn segmented(ui: &mut Ui, p: &Palette, options: &[&str], selected: usize) -> Option<usize> {
-    let mut clicked = None;
-    Frame::new()
-        .fill(p.segment_bg)
-        .corner_radius(theme::around(p.r_ctl, 1))
-        .inner_margin(Margin::same(2))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (i, option) in options.iter().enumerate() {
-                let on = i == selected;
-                let b = Button::new(RichText::new(*option).color(p.label))
-                    .fill(if on { p.segment_on } else { Color32::TRANSPARENT })
-                    .stroke(Stroke::NONE)
-                    .corner_radius(p.r_ctl.saturating_sub(1))
-                    .min_size(vec2(0.0, 26.0));
-                if ui.add(b).clicked() {
-                    clicked = Some(i);
-                }
-            }
-        });
-    clicked
-}
-
 fn section_label(ui: &mut Ui, p: &Palette, text: &str) {
     // `horizontal` sizes to its content; a centered layout here would swallow the
     // remaining height and push the rows below far down the window.
@@ -2795,6 +2954,7 @@ mod tests {
                     key: format!("img_{i:04}"),
                     image: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.JPG"))),
                     raw: Some(PathBuf::from(format!(r"Z:\cullery-test\IMG_{i:04}.CR3"))),
+                    ..Default::default()
                 })
                 .collect();
             app.picked.clear();
@@ -2947,6 +3107,70 @@ mod tests {
         cleanup(&dir);
     }
 
+    /// Show Paired RAW is offered only when a photo has a RAW partner, and turning it
+    /// off still leaves RAWs that have no partner on the grid.
+    #[test]
+    fn show_paired_raw_only_affects_pairs() {
+        let shot = |image: Option<&str>, raw: Option<&str>| Shot {
+            image: image.map(Into::into),
+            raw: raw.map(Into::into),
+            ..Default::default()
+        };
+        let pair = shot(Some("a.JPG"), Some("a.CR3"));
+        let image = shot(Some("b.PNG"), None);
+        let lone_raw = shot(None, Some("c.CR3"));
+        assert!(has_raw_pairs(&[pair.clone(), image.clone()]));
+        assert!(!has_raw_pairs(&[image.clone(), lone_raw.clone()]));
+        assert!(!has_raw_pairs(&[]));
+
+        let mut h = Harness::new();
+        h.app.shots = vec![pair, image, lone_raw];
+        let tiles = |h: &Harness| h.app.items().iter().map(|it| (it.shot, it.raw)).collect::<Vec<_>>();
+        h.app.settings.show_raw = false;
+        assert_eq!(tiles(&h), [(0, false), (1, false), (2, true)]);
+        h.app.settings.show_raw = true;
+        assert_eq!(tiles(&h), [(0, true), (0, false), (1, false), (2, true)]);
+    }
+
+    /// Changing the sort keeps picks and the selection on the same photos, and ends a
+    /// range, whose neighbours have changed.
+    #[test]
+    fn sorting_keeps_marks_with_their_photos() {
+        let (mut h, dir) = harness_with_files("sort");
+        std::fs::write(dir.join("IMG_0002.JPG"), b"a much longer file").unwrap();
+        h.app.shots = library::scan(&dir).unwrap();
+        h.app.picked = [2].into_iter().collect();
+        h.app.selected = [2].into_iter().collect();
+        h.app.current = 2;
+        h.app.range = Some((1, 3));
+        h.app.settings.sort_by = SortBy::Size;
+        h.app.settings.sort_descending = true;
+        h.app.resort();
+
+        assert_eq!(h.app.shots[0].name, "IMG_0002");
+        assert_eq!(h.app.picked, [0].into_iter().collect());
+        assert_eq!(h.app.selected, [0].into_iter().collect());
+        assert_eq!(h.app.current, 0);
+        assert_eq!(h.app.range, None);
+        h.frame(vec![], 0.016);
+        cleanup(&dir);
+    }
+
+    /// A photo named on the command line opens in the viewer, matched by file name
+    /// whether it's the JPG or the RAW, in any case.
+    #[test]
+    fn opens_the_viewer_at_a_named_photo() {
+        let mut h = Harness::new();
+        h.app.show_file(Path::new(r"Z:\cullery-test\img_0007.cr3"));
+        assert!(h.app.screen == Screen::Viewer);
+        assert_eq!(h.app.current, 7);
+
+        let mut h = Harness::new();
+        h.app.show_file(Path::new(r"Z:\cullery-test\notes.txt"));
+        assert!(h.app.screen == Screen::Grid);
+        assert!(h.app.message.as_ref().is_some_and(|(text, error)| *error && text.contains("notes.txt")));
+    }
+
     /// Leaving the viewer selects the photo only if it's still on the grid: after
     /// deleting the last photo, or unpicking it in View Picked, nothing is selected.
     #[test]
@@ -3034,8 +3258,12 @@ mod tests {
         assert_eq!(count, "1 photo");
         assert!(shown);
 
-        let both = Shot { name: "A".into(), key: "a".into(), image: Some("A.JPG".into()), raw: Some("A.CR3".into()) };
-        let jpg_only = Shot { name: "B".into(), key: "b".into(), image: Some("B.JPG".into()), raw: None };
+        let both = Shot { name: "A".into(), key: "a".into(), image: Some("A.JPG".into()), raw: Some("A.CR3".into()), ..Default::default() };
+        let jpg_only = Shot { name: "B".into(), key: "b".into(), image: Some("B.JPG".into()), ..Default::default() };
+        let png = Shot { name: "C".into(), key: "c.png".into(), image: Some("C.PNG".into()), ..Default::default() };
+        assert_eq!(drag_out_hint(&[&png], DragFiles::Raw).2, "No RAW files, so the PNGs will be sent");
+        assert_eq!(drag_out_hint(&[&png], DragFiles::Both).2, "The PNG files will be sent");
+        assert_eq!(drag_out_hint(&[&png, &jpg_only], DragFiles::Jpg).2, "Only the image files will be sent");
         let (_, count, note) = drag_out_hint(&[&both, &both], DragFiles::Raw);
         assert_eq!((count.as_str(), note.as_str()), ("2 photos", "Only the RAW files will be sent"));
         assert!(drag_out_hint(&[&both, &jpg_only], DragFiles::Raw).2.contains("JPGs for photos without one"));
@@ -3214,6 +3442,37 @@ mod tests {
         }
     }
 
+    /// Runs frames until the background delete has ended.
+    fn finish_deleting(h: &mut Harness) {
+        for _ in 0..2000 {
+            if h.app.deleting.is_none() {
+                return;
+            }
+            h.frame(vec![], 0.016);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the delete never finished");
+    }
+
+    /// While a delete runs the window keeps going, but keys can't start anything else.
+    #[test]
+    fn keys_do_nothing_while_deleting() {
+        let (mut h, dir) = harness_with_files("busy");
+        h.app.selected = [0, 1].into_iter().collect();
+        let ctx = h.ctx.clone();
+        h.app.delete_shots(&ctx, &[4], true);
+        let key = Event::Key { key: KeyCode::Delete, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        if h.app.deleting.is_some() {
+            // Time passes so the bar is drawn too.
+            h.frame(vec![], 0.5);
+            h.frame(vec![key], 0.016);
+            assert!(h.app.confirm_delete.is_none() || h.app.deleting.is_none());
+        }
+        finish_deleting(&mut h);
+        assert!(!dir.join("IMG_0004.JPG").exists());
+        cleanup(&dir);
+    }
+
     /// Deleting removes each shot's JPG and RAW; picks, selection and thumbnails
     /// still point at the right photos afterwards.
     #[test]
@@ -3227,6 +3486,7 @@ mod tests {
 
         let ctx = h.ctx.clone();
         h.app.delete_shots(&ctx, &[1, 2], true);
+        finish_deleting(&mut h);
 
         let left: Vec<String> = h.app.shots.iter().map(|s| s.name.clone()).collect();
         assert_eq!(left, ["IMG_0000", "IMG_0003", "IMG_0004", "IMG_0005"]);
@@ -3248,6 +3508,7 @@ mod tests {
         h.app.open_viewer(3);
         let ctx = h.ctx.clone();
         h.app.delete_shots(&ctx, &[3], true);
+        finish_deleting(&mut h);
         assert!(h.app.screen == Screen::Viewer);
         assert_eq!(h.app.shots[h.app.current].name, "IMG_0004");
         cleanup(&dir);

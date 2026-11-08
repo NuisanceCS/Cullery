@@ -3,7 +3,9 @@
 //! overwrites one, and never deletes one.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 struct Job {
@@ -127,19 +129,76 @@ fn copy_files(files: &[PathBuf], dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Deletes photo files: to the Recycle Bin, or permanently when `permanent` (memory
-/// cards have no Recycle Bin). Stops at the first failure.
-pub fn delete_files(files: &[PathBuf], permanent: bool) -> Result<(), String> {
-    if permanent {
-        for f in files {
-            std::fs::remove_file(f).map_err(|e| {
-                format!("Couldn't delete {}: {e}", f.file_name().unwrap_or_default().to_string_lossy())
-            })?;
-        }
-        Ok(())
-    } else {
-        trash::delete_all(files).map_err(|e| format!("Couldn't move the photos to the Recycle Bin: {e}"))
+/// A delete running on its own thread, so the window keeps drawing while thousands of
+/// files go.
+pub struct Deletion {
+    total: usize,
+    done: Arc<AtomicUsize>,
+    result: Receiver<Result<(), String>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Deletion {
+    pub fn start(files: Vec<PathBuf>, permanent: bool, ctx: eframe::egui::Context) -> Self {
+        let total = files.len();
+        let done = Arc::new(AtomicUsize::new(0));
+        let counter = done.clone();
+        let (tx, result) = channel();
+        let thread = std::thread::Builder::new()
+            .name("delete".into())
+            .spawn(move || {
+                let outcome = delete_files(&files, permanent, |n| {
+                    counter.fetch_add(n, Ordering::Relaxed);
+                    ctx.request_repaint();
+                });
+                let _ = tx.send(outcome);
+                ctx.request_repaint();
+            })
+            .expect("failed to start delete thread");
+        Self { total, done, result, thread: Some(thread) }
     }
+
+    /// Files deleted so far, and how many there are in all.
+    pub fn progress(&self) -> (usize, usize) {
+        (self.done.load(Ordering::Relaxed), self.total)
+    }
+
+    /// The outcome, once the delete has ended.
+    pub fn try_finish(&self) -> Option<Result<(), String>> {
+        match self.result.try_recv() {
+            Ok(outcome) => Some(outcome),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("The delete stopped unexpectedly.".into())),
+        }
+    }
+}
+
+impl Drop for Deletion {
+    /// A delete the user confirmed finishes even if the app is closed meanwhile.
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Deletes photo files: to the Recycle Bin, or permanently when `permanent` (memory
+/// cards have no Recycle Bin). Works through them in small groups, calling `progress`
+/// with each group's size. Stops at the first failure.
+fn delete_files(files: &[PathBuf], permanent: bool, progress: impl Fn(usize)) -> Result<(), String> {
+    for group in files.chunks((files.len() / 50).clamp(10, 100)) {
+        if permanent {
+            for f in group {
+                std::fs::remove_file(f).map_err(|e| {
+                    format!("Couldn't delete {}: {e}", f.file_name().unwrap_or_default().to_string_lossy())
+                })?;
+            }
+        } else {
+            trash::delete_all(group).map_err(|e| format!("Couldn't move the photos to the Recycle Bin: {e}"))?;
+        }
+        progress(group.len());
+    }
+    Ok(())
 }
 
 /// Whether `path` is somewhere Windows has no Recycle Bin: a removable drive (memory
@@ -189,6 +248,35 @@ mod tests {
         if card.exists() {
             println!("F:\\DCIM has no Recycle Bin: {}", has_no_recycle_bin(card));
         }
+    }
+
+    /// A big delete runs in the background and counts every file; a file that can't
+    /// be deleted is reported.
+    #[test]
+    fn deletes_in_the_background_with_progress() {
+        let base = std::env::temp_dir().join(format!("cullery-delete-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let files: Vec<PathBuf> = (0..250).map(|i| base.join(format!("{i}.jpg"))).collect();
+        for f in &files {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let wait = |job: &Deletion| loop {
+            if let Some(outcome) = job.try_finish() {
+                return outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+
+        let job = Deletion::start(files, true, eframe::egui::Context::default());
+        assert_eq!(wait(&job), Ok(()));
+        assert_eq!(job.progress(), (250, 250));
+        drop(job);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+
+        let job = Deletion::start(vec![base.join("missing.jpg")], true, eframe::egui::Context::default());
+        assert!(wait(&job).unwrap_err().contains("missing.jpg"));
+        drop(job);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// Same name and size but taken at a different time is a different photo; a

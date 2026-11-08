@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::library::SortBy;
 use crate::theme::ThemeId;
 
 /// `%APPDATA%\Cullery`, where settings and picks live.
@@ -37,6 +38,8 @@ pub struct Settings {
     pub export_on_pick: bool,
     /// Which files Export on Pick and Quick Export copy.
     pub export_files: DragFiles,
+    pub sort_by: SortBy,
+    pub sort_descending: bool,
     /// The values as last loaded or saved by this window, to tell which ones it changed.
     saved: Snapshot,
 }
@@ -52,6 +55,8 @@ struct Snapshot {
     theme: ThemeId,
     export_on_pick: bool,
     export_files: DragFiles,
+    sort_by: SortBy,
+    sort_descending: bool,
 }
 
 /// Which of a shot's files to use, when dragging photos out or copying them to the
@@ -122,6 +127,8 @@ impl Default for Settings {
             theme: ThemeId::AppleDark,
             export_on_pick: false,
             export_files: DragFiles::Both,
+            sort_by: SortBy::Name,
+            sort_descending: false,
         };
         Self::from_snapshot(saved)
     }
@@ -142,6 +149,8 @@ impl Settings {
             theme: s.theme,
             export_on_pick: s.export_on_pick,
             export_files: s.export_files,
+            sort_by: s.sort_by,
+            sort_descending: s.sort_descending,
             saved: s,
         }
     }
@@ -156,6 +165,8 @@ impl Settings {
             theme: self.theme,
             export_on_pick: self.export_on_pick,
             export_files: self.export_files,
+            sort_by: self.sort_by,
+            sort_descending: self.sort_descending,
         }
     }
 
@@ -185,6 +196,12 @@ impl Settings {
                         s.drag_files = d;
                     }
                 }
+                "sort_by" => {
+                    if let Some(by) = SortBy::ALL.into_iter().find(|b| b.key() == value) {
+                        s.sort_by = by;
+                    }
+                }
+                "sort_desc" => s.sort_descending = value == "1",
                 "export_on_pick" => s.export_on_pick = value == "1",
                 "export_files" => {
                     if let Some(d) = DragFiles::ALL.into_iter().find(|d| d.key() == value) {
@@ -242,6 +259,12 @@ impl Settings {
         if mine.export_files != base.export_files {
             merged.export_files = mine.export_files;
         }
+        if mine.sort_by != base.sort_by {
+            merged.sort_by = mine.sort_by;
+        }
+        if mine.sort_descending != base.sort_descending {
+            merged.sort_descending = mine.sort_descending;
+        }
 
         let mut text = String::new();
         if let Some(dir) = &merged.export_dir {
@@ -256,6 +279,8 @@ impl Settings {
         text += &format!("theme={}\n", merged.theme.key());
         text += &format!("export_on_pick={}\n", if merged.export_on_pick { 1 } else { 0 });
         text += &format!("export_files={}\n", merged.export_files.key());
+        text += &format!("sort_by={}\n", merged.sort_by.key());
+        text += &format!("sort_desc={}\n", if merged.sort_descending { 1 } else { 0 });
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -314,6 +339,8 @@ mod tests {
         s.theme = ThemeId::Win10Light;
         s.export_on_pick = true;
         s.export_files = DragFiles::Raw;
+        s.sort_by = SortBy::Size;
+        s.sort_descending = true;
         s.save_to(&path);
         let back = Settings::load_from(&path);
         std::fs::remove_file(&path).unwrap();

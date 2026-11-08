@@ -4,9 +4,11 @@
 //! (`IMG_4821.JPG` + `IMG_4821.CR3`), so pairing is done by name, ignoring case.
 //! Other image types (PNG, GIF, WebP, TIFF, BMP) are never paired: each is its own shot.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::raw;
 
@@ -15,8 +17,90 @@ pub const CAMERA_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heic", "heif"];
 /// Images shown on their own, never paired.
 const OTHER_IMAGE_EXTENSIONS: &[&str] = &["png", "gif", "webp", "tif", "tiff", "bmp", "avif"];
 
+/// What the grid is ordered by, like File Explorer's Sort by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBy {
+    Name,
+    Date,
+    Type,
+    Size,
+}
+
+impl SortBy {
+    pub const ALL: [SortBy; 4] = [SortBy::Name, SortBy::Date, SortBy::Type, SortBy::Size];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SortBy::Name => "name",
+            SortBy::Date => "date",
+            SortBy::Type => "type",
+            SortBy::Size => "size",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortBy::Name => "Name",
+            SortBy::Date => "Date modified",
+            SortBy::Type => "Type",
+            SortBy::Size => "Size",
+        }
+    }
+}
+
+/// Puts shots in order, with equal ones by name. Sizes and dates are those of the file
+/// the grid shows: the image, or the RAW if there's no image.
+pub fn sort(shots: &mut [Shot], by: SortBy, descending: bool) {
+    shots.sort_by(|a, b| {
+        let first = match by {
+            SortBy::Name => Ordering::Equal,
+            SortBy::Date => a.modified.cmp(&b.modified),
+            SortBy::Type => a.type_name().cmp(&b.type_name()),
+            SortBy::Size => a.size.cmp(&b.size),
+        };
+        let order = first.then_with(|| natural_cmp(&a.name, &b.name)).then_with(|| a.key.cmp(&b.key));
+        if descending { order.reverse() } else { order }
+    });
+}
+
+/// Compares names as File Explorer does: ignoring case, with runs of digits compared
+/// as numbers, so `IMG_9` comes before `IMG_10`.
+pub fn natural_cmp(a: &str, b: &str) -> Ordering {
+    fn number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+        let mut digits = String::new();
+        while let Some(c) = chars.next_if(char::is_ascii_digit) {
+            digits.push(c);
+        }
+        let trimmed = digits.trim_start_matches('0');
+        trimmed.to_string()
+    }
+    let (mut x, mut y) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (x.peek().copied(), y.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let (m, n) = (number(&mut x), number(&mut y));
+                let order = m.len().cmp(&n.len()).then_with(|| m.cmp(&n));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(c), Some(d)) => {
+                let order = c.to_lowercase().cmp(d.to_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                x.next();
+                y.next();
+            }
+        }
+    }
+}
+
 /// One shot: an image, a RAW, or both.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Shot {
     /// File name without extension, as found on disk (e.g. `IMG_4821`).
     pub name: String,
@@ -26,6 +110,9 @@ pub struct Shot {
     /// The viewable image: JPG, HEIC, PNG, GIF, …
     pub image: Option<PathBuf>,
     pub raw: Option<PathBuf>,
+    /// When the shown file was last modified, and its size in bytes (for sorting).
+    pub modified: Option<SystemTime>,
+    pub size: u64,
 }
 
 impl Shot {
@@ -55,6 +142,11 @@ impl Shot {
         extension(self.raw.as_deref()).map(|e| e.to_uppercase()).unwrap_or_else(|| "RAW".into())
     }
 
+    /// The type of the file the grid shows.
+    fn type_name(&self) -> String {
+        if self.image.is_some() { self.image_kind() } else { self.raw_kind() }
+    }
+
     /// A camera image (JPG/HEIC) that would normally come with a RAW.
     pub fn is_camera_image(&self) -> bool {
         extension(self.image.as_deref()).is_some_and(|e| CAMERA_IMAGE_EXTENSIONS.contains(&e.as_str()))
@@ -76,16 +168,15 @@ fn extension(path: Option<&Path>) -> Option<String> {
 
 /// Lists the shots in `dir` (not its subfolders), sorted alphabetically by name.
 pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+    let mut files: Vec<(PathBuf, std::fs::Metadata)> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|e| e.path())
+        .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| (e.path(), m)))
         .collect();
     // A set order, so the same file pairs up every time (see `taken` below).
-    files.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+    files.sort_by_key(|(p, _)| p.to_string_lossy().to_lowercase());
 
     let mut shots: BTreeMap<String, Shot> = BTreeMap::new();
-    for path in files {
+    for (path, meta) in files {
         let (Some(stem), Some(ext), Some(file)) = (
             path.file_stem().and_then(|s| s.to_str()),
             path.extension().and_then(|e| e.to_str()),
@@ -111,9 +202,12 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
         let shot = shots.entry(key.clone()).or_insert_with(|| Shot {
             name: stem.to_owned(),
             key,
-            image: None,
-            raw: None,
+            ..Default::default()
         });
+        if !is_raw || shot.image.is_none() {
+            shot.modified = meta.modified().ok();
+            shot.size = meta.len();
+        }
         if is_raw {
             shot.raw = Some(path);
         } else {
@@ -126,6 +220,41 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_sort_like_file_explorer() {
+        let mut names = ["IMG_10", "img_9", "IMG_100", "IMG_2", "photo", "IMG_02b"];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(names, ["IMG_2", "IMG_02b", "img_9", "IMG_10", "IMG_100", "photo"]);
+        assert_eq!(natural_cmp("IMG_0001", "img_1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn sorts_by_each_choice_and_direction() {
+        use std::time::Duration;
+        let shot = |name: &str, ext: &str, secs: u64, size: u64| Shot {
+            name: name.into(),
+            key: name.to_lowercase(),
+            image: Some(format!("{name}.{ext}").into()),
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+            size,
+            ..Default::default()
+        };
+        let mut shots = vec![shot("IMG_10", "JPG", 30, 5), shot("IMG_2", "PNG", 10, 9), shot("IMG_3", "JPG", 20, 7)];
+        let order = |shots: &[Shot]| shots.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+
+        sort(&mut shots, SortBy::Name, false);
+        assert_eq!(order(&shots), ["IMG_2", "IMG_3", "IMG_10"]);
+        sort(&mut shots, SortBy::Name, true);
+        assert_eq!(order(&shots), ["IMG_10", "IMG_3", "IMG_2"]);
+        sort(&mut shots, SortBy::Date, false);
+        assert_eq!(order(&shots), ["IMG_2", "IMG_3", "IMG_10"]);
+        sort(&mut shots, SortBy::Size, true);
+        assert_eq!(order(&shots), ["IMG_2", "IMG_3", "IMG_10"]);
+        // Same type: by name.
+        sort(&mut shots, SortBy::Type, false);
+        assert_eq!(order(&shots), ["IMG_3", "IMG_10", "IMG_2"]);
+    }
 
     #[test]
     fn pairs_camera_images_with_raw_and_keeps_others_separate() {
