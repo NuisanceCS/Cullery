@@ -33,6 +33,10 @@ pub struct Settings {
     pub tile_width: f32,
     pub drag_files: DragFiles,
     pub theme: ThemeId,
+    /// Picking also copies the photo to the export folder (off: picks are just marked).
+    pub export_on_pick: bool,
+    /// Which files Export on Pick and Quick Export copy.
+    pub export_files: DragFiles,
     /// The values as last loaded or saved by this window, to tell which ones it changed.
     saved: Snapshot,
 }
@@ -46,9 +50,12 @@ struct Snapshot {
     tile_width: f32,
     drag_files: DragFiles,
     theme: ThemeId,
+    export_on_pick: bool,
+    export_files: DragFiles,
 }
 
-/// Which of a shot's files go along when photos are dragged out of Cullery.
+/// Which of a shot's files to use, when dragging photos out or copying them to the
+/// export folder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DragFiles {
     /// The RAW (or the JPG, for shots without one). For editing in Lightroom / LightCraft.
@@ -84,6 +91,24 @@ impl DragFiles {
             DragFiles::Both => "Every file of each shot.",
         }
     }
+
+    /// The same choice, described for copying to the export folder.
+    pub fn export_description(self) -> &'static str {
+        match self {
+            DragFiles::Raw => "Just the RAW, to edit later. Shots without a RAW copy their JPG.",
+            DragFiles::Jpg => "Just the JPG, ready to share. Shots without a JPG copy their RAW.",
+            DragFiles::Both => "Both files of each shot: JPGs to send, RAWs to edit.",
+        }
+    }
+
+    /// The files of a shot to use: the preferred one, or the other if it's missing.
+    pub fn pick<'a>(self, image: Option<&'a PathBuf>, raw: Option<&'a PathBuf>) -> Vec<&'a PathBuf> {
+        match self {
+            DragFiles::Raw => raw.or(image).into_iter().collect(),
+            DragFiles::Jpg => image.or(raw).into_iter().collect(),
+            DragFiles::Both => image.into_iter().chain(raw).collect(),
+        }
+    }
 }
 
 impl Default for Settings {
@@ -95,6 +120,8 @@ impl Default for Settings {
             tile_width: 190.0,
             drag_files: DragFiles::Raw,
             theme: ThemeId::AppleDark,
+            export_on_pick: false,
+            export_files: DragFiles::Both,
         };
         Self::from_snapshot(saved)
     }
@@ -113,6 +140,8 @@ impl Settings {
             tile_width: s.tile_width,
             drag_files: s.drag_files,
             theme: s.theme,
+            export_on_pick: s.export_on_pick,
+            export_files: s.export_files,
             saved: s,
         }
     }
@@ -125,6 +154,8 @@ impl Settings {
             tile_width: self.tile_width,
             drag_files: self.drag_files,
             theme: self.theme,
+            export_on_pick: self.export_on_pick,
+            export_files: self.export_files,
         }
     }
 
@@ -152,6 +183,12 @@ impl Settings {
                 "drag_files" => {
                     if let Some(d) = DragFiles::ALL.into_iter().find(|d| d.key() == value) {
                         s.drag_files = d;
+                    }
+                }
+                "export_on_pick" => s.export_on_pick = value == "1",
+                "export_files" => {
+                    if let Some(d) = DragFiles::ALL.into_iter().find(|d| d.key() == value) {
+                        s.export_files = d;
                     }
                 }
                 "tile_width" => {
@@ -199,6 +236,12 @@ impl Settings {
         if mine.theme != base.theme {
             merged.theme = mine.theme;
         }
+        if mine.export_on_pick != base.export_on_pick {
+            merged.export_on_pick = mine.export_on_pick;
+        }
+        if mine.export_files != base.export_files {
+            merged.export_files = mine.export_files;
+        }
 
         let mut text = String::new();
         if let Some(dir) = &merged.export_dir {
@@ -211,6 +254,8 @@ impl Settings {
         text += &format!("tile_width={}\n", merged.tile_width.round());
         text += &format!("drag_files={}\n", merged.drag_files.key());
         text += &format!("theme={}\n", merged.theme.key());
+        text += &format!("export_on_pick={}\n", if merged.export_on_pick { 1 } else { 0 });
+        text += &format!("export_files={}\n", merged.export_files.key());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -262,6 +307,8 @@ mod tests {
         s.tile_width = 240.0;
         s.drag_files = DragFiles::Both;
         s.theme = ThemeId::Win10Light;
+        s.export_on_pick = true;
+        s.export_files = DragFiles::Raw;
         s.save_to(&path);
         let back = Settings::load_from(&path);
         std::fs::remove_file(&path).unwrap();

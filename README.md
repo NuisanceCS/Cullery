@@ -36,9 +36,12 @@ The built app is `target\release\cullery.exe`.
 - **Viewer:** `←` / `→` previous / next, `P` or `Space` pick, `Esc` back to grid.
   Scroll wheel zooms around the cursor, double-click zooms to that spot (again to fit),
   drag to move around. The zoom readout next to the arrows switches between Fit and 100%.
-- **Export folder:** the button in the top right. Picking copies the files right away;
-  un-picking moves those copies to the Recycle Bin. Picks are remembered per folder in
-  `%APPDATA%\Cullery\picks\`.
+- **Picks** are just marks unless **Export on Pick** (Settings, off by default) is on; then
+  picking also copies the chosen files (JPG + RAW by default) to the export folder.
+  Copies are never duplicated (an existing copy is reused), never overwritten (a
+  different file with the same name gets ` (2)`), and unpicking never deletes them.
+  Picks are remembered per folder in `%APPDATA%\Cullery\picks\`.
+- **Export folder:** the button in the top right, or Settings → Export on Pick.
 
 JPG and RAW are paired by file name (`IMG_4821.JPG` + `IMG_4821.CR3`); HEIC/HEIF pair the
 same way. PNG, GIF (animated in the viewer), WebP, TIFF and BMP show on their own.

@@ -42,7 +42,16 @@ enum Screen {
 enum SettingsPage {
     Keybinds,
     DragDrop,
+    ExportOnPick,
     Themes,
+}
+
+/// Something on the Export on Pick page that needs the app (a folder dialog).
+enum ExportAction {
+    None,
+    TurnOn,
+    TurnOff,
+    ChooseFolder,
 }
 
 /// Shortcuts shown on the Keybinds page: (keys, what they do).
@@ -425,38 +434,40 @@ impl App {
         self.set_picked(&[shot], pick);
     }
 
-    /// Picks or unpicks shots. Picks are always remembered; with an export folder set,
-    /// picking also copies JPG + RAW there (and unpicking moves those copies to the
-    /// Recycle Bin). Without one, nothing is asked: picks are just marked, ready for
-    /// View Picked and dragging into an editor.
+    /// Picks or unpicks shots. Picks are always remembered. With Export on Pick on,
+    /// picking also copies the chosen files to the export folder (never twice: a copy
+    /// already there is reused). Unpicking only removes the mark; copies stay.
     fn set_picked(&mut self, shots: &[usize], pick: bool) {
-        let dest = self.settings.export_dir.clone();
+        let dest = if pick && self.settings.export_on_pick { self.export_dir_or_ask() } else { None };
         for &shot in shots {
             if self.picked.contains(&shot) == pick {
                 continue;
             }
-            let files: Vec<PathBuf> = self.shots[shot].files().cloned().collect();
             if pick {
                 self.picked.insert(shot);
                 if let Some(dest) = &dest {
+                    let files = self.export_files(shot);
                     self.exporter.copy(shot, files, dest.clone(), None);
                 }
             } else {
                 self.picked.remove(&shot);
-                if let Some(dest) = &dest {
-                    self.exporter.remove(shot, files, dest.clone());
-                }
             }
         }
         self.save_picks();
     }
 
-    /// Hover text for picking: what picking does with the current export setting.
+    /// The files of a shot that Export on Pick and Quick Export copy (per Settings).
+    fn export_files(&self, shot: usize) -> Vec<PathBuf> {
+        let s = &self.shots[shot];
+        self.settings.export_files.pick(s.image.as_ref(), s.raw.as_ref()).into_iter().cloned().collect()
+    }
+
+    /// Hover text for picking: what picking does with the current settings.
     fn pick_tip(&self) -> &'static str {
-        if self.settings.export_dir.is_some() {
-            "Pick: mark and copy JPG + RAW to the export folder"
+        if self.settings.export_on_pick {
+            "Pick: mark and copy to the export folder (Export on Pick is on)"
         } else {
-            "Pick: mark as a keeper (set an export folder to also copy picks there)"
+            "Pick: mark as a keeper"
         }
     }
 
@@ -471,7 +482,8 @@ impl App {
         self.set_picked(&shots, !all_picked);
     }
 
-    /// Copies the selected photos (grid) or the shown photo (viewer), JPG + RAW.
+    /// Copies the selected photos (grid) or the shown photo (viewer): the files chosen
+    /// under Settings → Export on Pick.
     fn quick_export(&mut self) {
         let mut shots: Vec<usize> = match self.screen {
             Screen::Viewer => vec![self.current],
@@ -487,7 +499,7 @@ impl App {
         self.next_batch += 1;
         self.batches.insert(batch, Batch { remaining: shots.len(), shots: shots.len(), failed: false, dest: dest.clone() });
         for shot in shots {
-            let files: Vec<PathBuf> = self.shots[shot].files().cloned().collect();
+            let files = self.export_files(shot);
             self.exporter.copy(shot, files, dest.clone(), Some(batch));
         }
     }
@@ -658,34 +670,21 @@ impl App {
             }
         }
 
-        while let Some(done) = self.exporter.try_recv() {
-            match done {
-                Done::Copied { shot, batch, result } => {
-                    if let Err(e) = &result {
-                        if batch.is_none() {
-                            self.picked.remove(&shot);
-                            self.save_picks();
-                        }
-                        self.error(e.clone());
-                    }
-                    let Some(id) = batch else { continue };
-                    let Some(b) = self.batches.get_mut(&id) else { continue };
-                    b.remaining -= 1;
-                    b.failed |= result.is_err();
-                    if b.remaining == 0 {
-                        let b = self.batches.remove(&id).unwrap();
-                        if !b.failed {
-                            let what = if b.shots == 1 { "1 photo".to_string() } else { format!("{} photos", b.shots) };
-                            self.show_toast(ctx, format!("Exported {what} to {}", folder_name(&b.dest)));
-                        }
-                    }
+        while let Some(Done { batch, result, .. }) = self.exporter.try_recv() {
+            // A failed copy is reported; the pick itself stays marked.
+            if let Err(e) = &result {
+                self.error(e.clone());
+            }
+            let Some(id) = batch else { continue };
+            let Some(b) = self.batches.get_mut(&id) else { continue };
+            b.remaining -= 1;
+            b.failed |= result.is_err();
+            if b.remaining == 0 {
+                let b = self.batches.remove(&id).unwrap();
+                if !b.failed {
+                    let what = if b.shots == 1 { "1 photo".to_string() } else { format!("{} photos", b.shots) };
+                    self.show_toast(ctx, format!("Exported {what} to {}", folder_name(&b.dest)));
                 }
-                Done::Removed { shot, result: Err(e) } => {
-                    self.picked.insert(shot);
-                    self.save_picks();
-                    self.error(e);
-                }
-                Done::Removed { .. } => {}
             }
         }
 
@@ -958,19 +957,8 @@ impl App {
         let mut paths = Vec::new();
         for &s in shots {
             let shot = &self.shots[s];
-            let files: Vec<&PathBuf> = match self.settings.drag_files {
-                DragFiles::Raw => shot.raw.as_ref().or(shot.image.as_ref()).into_iter().collect(),
-                DragFiles::Jpg => shot.image.as_ref().or(shot.raw.as_ref()).into_iter().collect(),
-                DragFiles::Both => shot.files().collect(),
-            };
-            for file in files {
-                let copy = self
-                    .settings
-                    .export_dir
-                    .as_ref()
-                    .zip(file.file_name())
-                    .map(|(dir, name)| dir.join(name))
-                    .filter(|c| c.is_file());
+            for file in self.settings.drag_files.pick(shot.image.as_ref(), shot.raw.as_ref()) {
+                let copy = self.settings.export_dir.as_ref().and_then(|dir| export::existing_copy(file, dir));
                 paths.push(copy.unwrap_or_else(|| file.clone()));
             }
         }
@@ -1539,11 +1527,7 @@ impl App {
 
         // Pick circle (top-right), registered after the tile so it takes the click.
         let circle_rect = Rect::from_min_size(pos2(thumb_rect.max.x - 44.0, thumb_rect.min.y), Vec2::splat(44.0));
-        let tip = match (picked, self.settings.export_dir.is_some()) {
-            (true, true) => "Unpick (moves the copies to the Recycle Bin)",
-            (true, false) => "Unpick",
-            (false, _) => self.pick_tip(),
-        };
+        let tip = if picked { "Unpick (any copies stay in the export folder)" } else { self.pick_tip() };
         let circle = (!selecting).then(|| ui.interact(circle_rect, ui.id().with(("pick", item.shot, item.raw)), Sense::click()).on_hover_text(tip));
 
         let painter = ui.painter();
@@ -1760,12 +1744,16 @@ impl App {
         if self.picked.contains(&shot) && self.zoom.is_none() {
             let painter = ui.painter();
             let s = &self.shots[shot];
-            let copied = match (s.image.is_some(), s.raw.is_some()) {
-                (true, true) => format!("{} + {}", s.image_kind(), s.raw_kind()),
-                (true, false) => s.image_kind(),
-                _ => s.raw_kind(),
-            };
-            let text = if self.settings.export_dir.is_some() { format!("Picked · {copied} copied") } else { "Picked".to_string() };
+            // Which of this shot's files Export on Pick copies, e.g. "JPG + CR3".
+            let copied = self
+                .settings
+                .export_files
+                .pick(s.image.as_ref(), s.raw.as_ref())
+                .into_iter()
+                .map(|f| if Some(f) == s.raw.as_ref() { s.raw_kind() } else { s.image_kind() })
+                .collect::<Vec<_>>()
+                .join(" + ");
+            let text = if self.settings.export_on_pick { format!("Picked · {copied} copied") } else { "Picked".to_string() };
             let g = painter.layout_no_wrap(text, theme::font(13.0), Color32::WHITE);
             let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 20.0), g.size() + vec2(44.0, 14.0));
             painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
@@ -2028,6 +2016,7 @@ impl App {
         let p = self.p;
         let mut open = true;
         let mut chosen_theme = None;
+        let mut export_action = ExportAction::None;
         // Every page gets the same fixed area (long pages scroll inside it), so the
         // window keeps one size when switching pages.
         const SIDEBAR_W: f32 = 140.0;
@@ -2046,6 +2035,7 @@ impl App {
                         ui.set_min_height(PAGE.y);
                         let pages = [
                             (SettingsPage::DragDrop, "Drag & Drop"),
+                            (SettingsPage::ExportOnPick, "Export on Pick"),
                             (SettingsPage::Keybinds, "Keybinds"),
                             (SettingsPage::Themes, "Themes"),
                         ];
@@ -2070,6 +2060,7 @@ impl App {
                         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match page {
                             SettingsPage::Keybinds => keybinds_page(ui, &p),
                             SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
+                            SettingsPage::ExportOnPick => export_action = export_page(ui, &p, &mut self.settings),
                             SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.settings.theme),
                         });
                     });
@@ -2077,6 +2068,23 @@ impl App {
             });
         if let Some(theme) = chosen_theme {
             self.set_theme(ctx, theme);
+        }
+        match export_action {
+            ExportAction::None => {}
+            // Export on Pick needs somewhere to copy to: ask first; cancelling leaves it off.
+            ExportAction::TurnOn => {
+                if self.settings.export_dir.is_some() || self.choose_export() {
+                    self.settings.export_on_pick = true;
+                    self.settings.save();
+                }
+            }
+            ExportAction::TurnOff => {
+                self.settings.export_on_pick = false;
+                self.settings.save();
+            }
+            ExportAction::ChooseFolder => {
+                self.choose_export();
+            }
         }
         if !open {
             self.settings_page = None;
@@ -2130,6 +2138,83 @@ fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
 
 /// A card per theme, drawn in that theme's own colors and corner style. Returns the
 /// theme clicked, if any.
+fn export_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) -> ExportAction {
+    let mut action = ExportAction::None;
+    ui.horizontal(|ui| {
+        if toggle_switch(ui, p, settings.export_on_pick).clicked() {
+            action = if settings.export_on_pick { ExportAction::TurnOff } else { ExportAction::TurnOn };
+        }
+        ui.label(RichText::new("Export on Pick").font(theme::font_semibold(14.0)));
+    });
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "When this is on, picking a photo automatically creates a copy of it in your export folder. \
+             Picking the same photo again never makes a second copy, and unpicking leaves copies where they are.",
+        )
+        .color(p.label2),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "When it's off, picking just marks your keepers. Use View Picked to drag them into Lightroom \
+             or LightCraft, or Quick Export to copy them.",
+        )
+        .color(p.label2),
+    );
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("Export folder").font(theme::font_semibold(13.5)));
+    ui.horizontal(|ui| {
+        let (text, color) = match &settings.export_dir {
+            Some(dir) => (dir.display().to_string(), p.label),
+            None => ("Not set".to_string(), p.label2),
+        };
+        ui.add(egui::Label::new(RichText::new(text).color(color)).truncate());
+        if ui.button("Choose…").clicked() {
+            action = ExportAction::ChooseFolder;
+        }
+    });
+
+    ui.add_space(14.0);
+    ui.label(RichText::new("Files to copy").font(theme::font_semibold(13.5)));
+    ui.add_space(4.0);
+    for choice in [DragFiles::Both, DragFiles::Raw, DragFiles::Jpg] {
+        let on = settings.export_files == choice;
+        let r = ui.radio(on, RichText::new(choice.label()).font(theme::font_semibold(13.5)));
+        ui.indent(("export", choice.label()), |ui| {
+            ui.label(RichText::new(choice.export_description()).color(p.label2));
+        });
+        if r.clicked() && !on {
+            settings.export_files = choice;
+            settings.save();
+        }
+        ui.add_space(4.0);
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new("Quick Export copies the same files.").color(p.label2).italics());
+    action
+}
+
+/// An on/off switch in the theme's accent color.
+fn toggle_switch(ui: &mut Ui, p: &Palette, on: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::click());
+    let t = ui.ctx().animate_bool(resp.id, on);
+    let painter = ui.painter();
+    let radius = if p.r_pill == 0 { 0 } else { 11 };
+    let track = if on { p.accent } else { p.control };
+    painter.rect_filled(rect, radius, track);
+    painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, if on { p.accent } else { p.control_border }), StrokeKind::Inside);
+    let x = egui::lerp(rect.min.x + 11.0..=rect.max.x - 11.0, t);
+    let knob = if on { p.on_accent } else { p.label2 };
+    if p.r_pill == 0 {
+        painter.rect_filled(Rect::from_center_size(pos2(x, rect.center().y), Vec2::splat(12.0)), 0, knob);
+    } else {
+        painter.circle_filled(pos2(x, rect.center().y), 7.0, knob);
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 fn themes_page(ui: &mut Ui, p: &Palette, current: ThemeId) -> Option<ThemeId> {
     let mut chosen = None;
     ui.label(RichText::new("Theme").font(theme::font_semibold(13.5)).color(p.label2));
@@ -2741,18 +2826,19 @@ mod tests {
     /// Drags send the chosen file type, from the export folder when a copy is there.
     #[test]
     fn drag_paths_follow_setting_and_prefer_export_copies() {
-        let mut h = Harness::new();
-        let export = std::env::temp_dir().join(format!("cullery-drag-test-{}", std::process::id()));
+        let (mut h, dir) = harness_with_files("drag-paths");
+        let export = dir.join("export");
         std::fs::create_dir_all(&export).unwrap();
+        // A copy of IMG_0003.CR3 already exported (same size as the original).
         std::fs::write(export.join("IMG_0003.CR3"), b"x").unwrap();
         h.app.settings.export_dir = Some(export.clone());
 
         h.app.settings.drag_files = DragFiles::Raw;
         let paths = h.app.drag_paths(&[3, 4]);
-        assert_eq!(paths, vec![export.join("IMG_0003.CR3"), PathBuf::from(r"Z:\cullery-test\IMG_0004.CR3")]);
+        assert_eq!(paths, vec![export.join("IMG_0003.CR3"), dir.join("IMG_0004.CR3")]);
 
         h.app.settings.drag_files = DragFiles::Jpg;
-        assert_eq!(h.app.drag_paths(&[4]), vec![PathBuf::from(r"Z:\cullery-test\IMG_0004.JPG")]);
+        assert_eq!(h.app.drag_paths(&[4]), vec![dir.join("IMG_0004.JPG")]);
 
         h.app.settings.drag_files = DragFiles::Both;
         assert_eq!(h.app.drag_paths(&[4]).len(), 2);
@@ -2760,9 +2846,8 @@ mod tests {
         // A shot with no RAW sends its JPG even in RAW mode.
         h.app.shots[4].raw = None;
         h.app.settings.drag_files = DragFiles::Raw;
-        assert_eq!(h.app.drag_paths(&[4]), vec![PathBuf::from(r"Z:\cullery-test\IMG_0004.JPG")]);
-
-        std::fs::remove_dir_all(&export).unwrap();
+        assert_eq!(h.app.drag_paths(&[4]), vec![dir.join("IMG_0004.JPG")]);
+        cleanup(&dir);
     }
 
     /// Pressing on a photo and moving starts a drag of it (selecting it, like
@@ -3006,6 +3091,72 @@ mod tests {
         assert!(h.app.confirm_delete.is_none());
         assert!(dir.join("IMG_0000.JPG").exists() && dir.join("IMG_0000.CR3").exists());
         assert!(h.app.selected.contains(&0), "Esc on the dialog doesn't clear the selection");
+        cleanup(&dir);
+    }
+
+    /// Runs frames until every background copy has finished.
+    fn wait_for_copies(h: &mut Harness) {
+        for _ in 0..500 {
+            if h.app.exporter.pending() == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            h.frame(vec![], 0.016);
+        }
+        panic!("copies didn't finish");
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Export on Pick: picking copies (JPG + RAW by default); unpicking deletes nothing;
+    /// picking again makes no second copy.
+    #[test]
+    fn export_on_pick_never_duplicates_or_deletes() {
+        let (mut h, dir) = harness_with_files("export-on-pick");
+        let export = dir.join("export");
+        h.app.settings.export_dir = Some(export.clone());
+        h.app.settings.export_on_pick = true;
+        h.app.settings.export_files = DragFiles::Both;
+
+        h.app.toggle_pick(1);
+        wait_for_copies(&mut h);
+        assert_eq!(files_in(&export), ["IMG_0001.CR3", "IMG_0001.JPG"]);
+
+        h.app.toggle_pick(1); // unpick
+        wait_for_copies(&mut h);
+        assert!(!h.app.picked.contains(&1));
+        assert_eq!(files_in(&export), ["IMG_0001.CR3", "IMG_0001.JPG"], "unpicking keeps the copies");
+
+        h.app.toggle_pick(1); // pick again
+        wait_for_copies(&mut h);
+        assert_eq!(files_in(&export), ["IMG_0001.CR3", "IMG_0001.JPG"], "no second copy");
+        cleanup(&dir);
+    }
+
+    /// With Export on Pick off, picking copies nothing, even with a folder set; the
+    /// files choice decides what Export on Pick copies.
+    #[test]
+    fn export_on_pick_off_and_file_choice() {
+        let (mut h, dir) = harness_with_files("export-choice");
+        let export = dir.join("export");
+        h.app.settings.export_dir = Some(export.clone());
+        h.app.settings.export_on_pick = false;
+        h.app.toggle_pick(2);
+        wait_for_copies(&mut h);
+        assert!(h.app.picked.contains(&2));
+        assert!(files_in(&export).is_empty(), "nothing copied while off");
+
+        h.app.settings.export_on_pick = true;
+        h.app.settings.export_files = DragFiles::Raw;
+        h.app.toggle_pick(3);
+        wait_for_copies(&mut h);
+        assert_eq!(files_in(&export), ["IMG_0003.CR3"]);
         cleanup(&dir);
     }
 

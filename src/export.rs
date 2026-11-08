@@ -1,19 +1,25 @@
-//! Copies picked shots (JPG + RAW) to the export folder on a background thread,
-//! so slow SD cards never freeze the window.
+//! Copies photos to the export folder on a background thread, so slow SD cards never
+//! freeze the window — and never makes a second copy of the same file, never
+//! overwrites one, and never deletes one.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-enum Job {
-    Copy { shot: usize, files: Vec<PathBuf>, dest: PathBuf, batch: Option<u64> },
-    Remove { shot: usize, files: Vec<PathBuf>, dest: PathBuf },
+struct Job {
+    shot: usize,
+    files: Vec<PathBuf>,
+    dest: PathBuf,
+    batch: Option<u64>,
 }
 
-pub enum Done {
-    /// `batch` groups the copies of one Quick Export, so the UI can confirm when all finish.
-    Copied { shot: usize, batch: Option<u64>, result: Result<(), String> },
-    Removed { shot: usize, result: Result<(), String> },
+/// A finished copy. `batch` groups the copies of one Quick Export, so the UI can
+/// confirm when all of them are done.
+pub struct Done {
+    #[allow(dead_code)] // reported for completeness; the UI only needs batch + result
+    pub shot: usize,
+    pub batch: Option<u64>,
+    pub result: Result<(), String>,
 }
 
 pub struct Exporter {
@@ -31,18 +37,8 @@ impl Exporter {
             .name("export".into())
             .spawn(move || {
                 for job in job_rx {
-                    let done = match job {
-                        Job::Copy { shot, files, dest, batch } => Done::Copied {
-                            shot,
-                            batch,
-                            result: copy_files(&files, &dest),
-                        },
-                        Job::Remove { shot, files, dest } => Done::Removed {
-                            shot,
-                            result: remove_copies(&files, &dest),
-                        },
-                    };
-                    let _ = done_tx.send(done);
+                    let result = copy_files(&job.files, &job.dest);
+                    let _ = done_tx.send(Done { shot: job.shot, batch: job.batch, result });
                     ctx.request_repaint();
                 }
             })
@@ -51,16 +47,8 @@ impl Exporter {
     }
 
     pub fn copy(&mut self, shot: usize, files: Vec<PathBuf>, dest: PathBuf, batch: Option<u64>) {
-        self.send(Job::Copy { shot, files, dest, batch });
-    }
-
-    pub fn remove(&mut self, shot: usize, files: Vec<PathBuf>, dest: PathBuf) {
-        self.send(Job::Remove { shot, files, dest });
-    }
-
-    fn send(&mut self, job: Job) {
         if let Some(jobs) = &self.jobs {
-            if jobs.send(job).is_ok() {
+            if jobs.send(Job { shot, files, dest, batch }).is_ok() {
                 self.pending += 1;
             }
         }
@@ -72,7 +60,7 @@ impl Exporter {
         Some(done)
     }
 
-    /// Number of copy/remove jobs still running.
+    /// Number of copy jobs still running.
     pub fn pending(&self) -> usize {
         self.pending
     }
@@ -88,38 +76,56 @@ impl Drop for Exporter {
     }
 }
 
+/// Where a file's copy in `dest` is or would go: `Ok(Existing)` if `dest` already holds
+/// a copy of it (so it's never copied twice), else the first free name — `IMG_0001.JPG`,
+/// or `IMG_0001 (2).JPG` when a different file already has that name (it's never
+/// overwritten).
+enum Target {
+    Existing(PathBuf),
+    New(PathBuf),
+}
+
+fn copy_target(src: &Path, dest: &Path) -> Option<Target> {
+    let name = src.file_name()?;
+    let stem = src.file_stem()?.to_string_lossy();
+    let ext = src.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for n in 1..=999 {
+        let candidate = if n == 1 { dest.join(name) } else { dest.join(format!("{stem} ({n}){ext}")) };
+        if is_copy_of(&candidate, src) {
+            return Some(Target::Existing(candidate));
+        }
+        if !candidate.exists() {
+            return Some(Target::New(candidate));
+        }
+    }
+    None
+}
+
+/// The copy of `src` already in `dest`, if there is one.
+pub fn existing_copy(src: &Path, dest: &Path) -> Option<PathBuf> {
+    match copy_target(src, dest)? {
+        Target::Existing(path) => Some(path),
+        Target::New(_) => None,
+    }
+}
+
 fn copy_files(files: &[PathBuf], dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("Couldn't create {}: {e}", dest.display()))?;
     for src in files {
-        let Some(name) = src.file_name() else { continue };
-        let target = dest.join(name);
-        if is_copy_of(&target, src) {
-            continue;
-        }
+        let name = src.file_name().unwrap_or_default().to_string_lossy();
+        let target = match copy_target(src, dest) {
+            Some(Target::Existing(_)) => continue,
+            Some(Target::New(path)) => path,
+            None => return Err(format!("Too many files named like {name} in the export folder")),
+        };
         // Copy under a temporary name first so a pulled card never leaves a half file behind.
         let mut partial = target.clone().into_os_string();
         partial.push(".partial");
         let partial = PathBuf::from(partial);
-        std::fs::copy(src, &partial)
-            .and_then(|_| std::fs::rename(&partial, &target))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&partial);
-                format!("Couldn't copy {}: {e}", name.to_string_lossy())
-            })?;
-    }
-    Ok(())
-}
-
-/// Un-picking moves the copies this app made to the Recycle Bin. Files in the export
-/// folder that don't match the original (e.g. edited since) are left alone.
-fn remove_copies(files: &[PathBuf], dest: &Path) -> Result<(), String> {
-    for src in files {
-        let Some(name) = src.file_name() else { continue };
-        let target = dest.join(name);
-        if is_copy_of(&target, src) {
-            trash::delete(&target)
-                .map_err(|e| format!("Couldn't move {} to the Recycle Bin: {e}", name.to_string_lossy()))?;
-        }
+        std::fs::copy(src, &partial).and_then(|_| std::fs::rename(&partial, &target)).map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("Couldn't copy {name}: {e}")
+        })?;
     }
     Ok(())
 }
@@ -158,11 +164,20 @@ pub fn on_removable_drive(_path: &Path) -> bool {
     false
 }
 
-#[cfg(all(test, windows))]
+/// A file in the export folder counts as a copy of `src` when it has the same size.
+fn is_copy_of(target: &Path, src: &Path) -> bool {
+    match (std::fs::metadata(target), std::fs::metadata(src)) {
+        (Ok(t), Ok(s)) => t.is_file() && t.len() == s.len(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// The system drive is never removable; a memory card in F: (if present) is.
+    #[cfg(windows)]
     #[test]
     fn detects_removable_drives() {
         assert!(!on_removable_drive(Path::new(r"C:\Users")));
@@ -171,11 +186,35 @@ mod tests {
             println!("F:\\DCIM removable: {}", on_removable_drive(card));
         }
     }
-}
 
-fn is_copy_of(target: &Path, src: &Path) -> bool {
-    match (std::fs::metadata(target), std::fs::metadata(src)) {
-        (Ok(t), Ok(s)) => t.is_file() && t.len() == s.len(),
-        _ => false,
+    /// Copying the same files again makes no new copies; a different file that already
+    /// has the name is left alone and the new copy gets "(2)".
+    #[test]
+    fn never_duplicates_or_overwrites() {
+        let base = std::env::temp_dir().join(format!("cullery-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (card, dest) = (base.join("card"), base.join("export"));
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let (jpg, raw) = (card.join("IMG_0001.JPG"), card.join("IMG_0001.CR3"));
+        std::fs::write(&jpg, b"jpeg bytes").unwrap();
+        std::fs::write(&raw, b"raw bytes, longer").unwrap();
+        // An edited / unrelated file already using the JPG's name.
+        std::fs::write(dest.join("IMG_0001.JPG"), b"someone else's edit").unwrap();
+
+        let files = vec![jpg.clone(), raw.clone()];
+        for _ in 0..3 {
+            copy_files(&files, &dest).unwrap();
+        }
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        let edit_kept = std::fs::read(dest.join("IMG_0001.JPG")).unwrap() == b"someone else's edit";
+        let found = existing_copy(&jpg, &dest);
+        std::fs::remove_dir_all(&base).unwrap();
+
+        assert_eq!(names, ["IMG_0001 (2).JPG", "IMG_0001.CR3", "IMG_0001.JPG"]);
+        assert!(edit_kept, "the existing file isn't overwritten");
+        assert_eq!(found, Some(dest.join("IMG_0001 (2).JPG")));
     }
 }
