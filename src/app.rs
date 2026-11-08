@@ -205,7 +205,8 @@ pub struct App {
     thumbs: HashMap<usize, Thumb>,
     fulls: HashMap<usize, FullImage>,
     original: Option<(usize, TextureHandle)>,
-    failed: HashSet<Key>,
+    /// Loads that failed, and why.
+    failed: HashMap<Key, String>,
     frame: u64,
 
     /// Viewer zoom in screen points per image pixel; `None` = fit to window.
@@ -296,7 +297,7 @@ impl App {
             thumbs: HashMap::new(),
             fulls: HashMap::new(),
             original: None,
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             frame: 0,
             zoom: None,
             zoom_center: Vec2::ZERO,
@@ -605,8 +606,8 @@ impl App {
             let animation = loaded.animation;
             let (image, original) = match loaded.image {
                 Ok(v) => v,
-                Err(_) => {
-                    self.failed.insert(key);
+                Err(reason) => {
+                    self.failed.insert(key, reason);
                     continue;
                 }
             };
@@ -688,11 +689,11 @@ impl App {
             let have = self.thumbs.get(&shot).map(|t| t.kind);
             let is_visible = i < visible.len();
             let preview = Key { shot, kind: Kind::Preview };
-            if have.is_none() && is_visible && !self.failed.contains(&preview) {
+            if have.is_none() && is_visible && !self.failed.contains_key(&preview) {
                 previews.push(Request { key: preview, path: path.clone(), max: [THUMB_PX, THUMB_PX] });
             }
             let thumb = Key { shot, kind: Kind::Thumb };
-            if have != Some(Kind::Thumb) && !self.failed.contains(&thumb) {
+            if have != Some(Kind::Thumb) && !self.failed.contains_key(&thumb) {
                 sharp.push(Request { key: thumb, path: path.clone(), max: [THUMB_PX, THUMB_PX] });
             }
         }
@@ -1539,8 +1540,10 @@ impl App {
             t.last_used = self.frame;
             let fit = fit_rect(thumb_rect, t.tex.size_vec2());
             Image::new((t.tex.id(), fit.size())).corner_radius(p.r_thumb.saturating_sub(2)).paint_at(ui, fit);
-        } else if self.failed.contains(&Key { shot: item.shot, kind: Kind::Thumb }) {
-            painter.text(thumb_rect.center(), Align2::CENTER_CENTER, "No preview", theme::font(12.0), p.label2);
+        } else if let Some(reason) = self.failed.get(&Key { shot: item.shot, kind: Kind::Thumb }) {
+            let help = shot.display_path().and_then(|path| codec_help(path, reason));
+            let text = help.map_or("No preview", |h| h.short);
+            painter.text(thumb_rect.center(), Align2::CENTER_CENTER, text, theme::font(12.0), p.label2);
         }
         let hovered = resp.hovered() || circle.as_ref().is_some_and(|c| c.hovered());
         if resp.hovered() {
@@ -1720,9 +1723,17 @@ impl App {
                     let fit = fit_rect(area, t.tex.size_vec2());
                     Image::new((t.tex.id(), fit.size())).corner_radius(4).paint_at(ui, fit);
                 } else {
-                    let failed = self.failed.contains(&Key { shot, kind: Kind::Full });
-                    let text = if failed { "No preview found in this file" } else { "Loading…" };
-                    ui.painter().text(area.center(), Align2::CENTER_CENTER, text, theme::font(14.0), p.label2);
+                    let reason = self.failed.get(&Key { shot, kind: Kind::Full });
+                    let help = reason.and_then(|r| self.shots[shot].display_path().and_then(|path| codec_help(path, r)));
+                    match (reason, help) {
+                        (_, Some(help)) => codec_help_panel(ui, &p, area, &help),
+                        (Some(_), None) => {
+                            ui.painter().text(area.center(), Align2::CENTER_CENTER, "No preview found in this file", theme::font(14.0), p.label2);
+                        }
+                        (None, None) => {
+                            ui.painter().text(area.center(), Align2::CENTER_CENTER, "Loading…", theme::font(14.0), p.label2);
+                        }
+                    }
                 }
             }
         }
@@ -1750,7 +1761,7 @@ impl App {
             let full_w = self.fulls.get(&shot).map(|f| f.tex.size_vec2().x).unwrap_or(0.0);
             let have = self.original.as_ref().is_some_and(|(s, _)| *s == shot);
             let key = Key { shot, kind: Kind::Original };
-            if zoom * ppp * orig.x > full_w * 1.05 && !have && !self.failed.contains(&key) {
+            if zoom * ppp * orig.x > full_w * 1.05 && !have && !self.failed.contains_key(&key) {
                 if let Some(path) = self.shots[shot].display_path() {
                     let side = ui.input(|i| i.max_texture_side) as u32;
                     requests.push(Request { key, path: path.clone(), max: [side, side] });
@@ -1766,7 +1777,7 @@ impl App {
                 let s = if i == pos { shot } else { s };
                 let key = Key { shot: s, kind: Kind::Full };
                 if let Some(path) = self.shots[s].display_path() {
-                    if !self.fulls.contains_key(&s) && !self.failed.contains(&key) {
+                    if !self.fulls.contains_key(&s) && !self.failed.contains_key(&key) {
                         requests.push(Request { key, path: path.clone(), max });
                     }
                 }
@@ -2142,6 +2153,73 @@ fn theme_card(ui: &mut Ui, p: &Palette, id: ThemeId, selected: bool) -> Response
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// What to tell the user when Windows can't open a HEIC/HEIF/AVIF file because a
+/// Microsoft Store extension is missing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CodecHelp {
+    /// Fits on a grid tile.
+    short: &'static str,
+    title: &'static str,
+    detail: &'static str,
+    button: &'static str,
+    store_link: &'static str,
+}
+
+const HEIF_EXTENSION: CodecHelp = CodecHelp {
+    short: "Needs HEIC reader",
+    title: "This HEIC photo needs a reader",
+    detail: "Windows opens HEIC photos with Microsoft's free HEIF Image Extension. Install it, then reopen this folder.",
+    button: "Get HEIF Image Extension",
+    store_link: "ms-windows-store://pdp/?ProductId=9PMMSR1CGPWG",
+};
+
+const HEVC_EXTENSION: CodecHelp = CodecHelp {
+    short: "Needs HEVC extension",
+    title: "Couldn't open this HEIC photo",
+    detail: "Windows has a HEIC reader, but HEIC photos are compressed with HEVC, which also needs the HEVC Video Extensions. Install it, then reopen this folder. (If it still won't open, the file may be damaged.)",
+    button: "Get HEVC Video Extensions",
+    store_link: "ms-windows-store://pdp/?ProductId=9NMZLZ57R3T7",
+};
+
+const AV1_EXTENSION: CodecHelp = CodecHelp {
+    short: "Needs AVIF reader",
+    title: "This AVIF image needs a reader",
+    detail: "Windows opens AVIF images with Microsoft's free AV1 Video Extension. Install it, then reopen this folder.",
+    button: "Get AV1 Video Extension",
+    store_link: "ms-windows-store://pdp/?ProductId=9MVZQVXJBQ9V",
+};
+
+/// Help for a file that failed to load, if the failure is a missing Windows extension.
+fn codec_help(path: &Path, reason: &str) -> Option<CodecHelp> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let windows_failed = reason == crate::wic::NO_READER || reason.starts_with(crate::wic::DECODE_FAILED);
+    match ext.as_str() {
+        "heic" | "heif" if reason == crate::wic::NO_READER => Some(HEIF_EXTENSION),
+        "heic" | "heif" if windows_failed => Some(HEVC_EXTENSION),
+        "avif" if windows_failed => Some(AV1_EXTENSION),
+        _ => None,
+    }
+}
+
+/// The viewer's message for a missing extension, with a button to its Store page.
+fn codec_help_panel(ui: &mut Ui, p: &Palette, area: Rect, help: &CodecHelp) {
+    let card = Rect::from_center_size(area.center(), vec2(440.0, 170.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(card).layout(Layout::top_down(Align::Center)), |ui| {
+        ui.label(RichText::new(help.title).font(theme::font_semibold(17.0)).color(p.label));
+        ui.add_space(6.0);
+        ui.label(RichText::new(help.detail).color(p.label2));
+        ui.add_space(14.0);
+        let button = Button::new(RichText::new(help.button).color(p.on_accent).font(theme::font_semibold(13.5)))
+            .fill(p.accent)
+            .stroke(Stroke::NONE)
+            .corner_radius(p.r_pill)
+            .min_size(vec2(0.0, 34.0));
+        if ui.add(button).on_hover_text("Opens the Microsoft Store").clicked() {
+            crate::window::open_link(help.store_link);
+        }
+    });
+}
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
@@ -2760,6 +2838,18 @@ mod tests {
         assert!(h.app.zoom.is_none(), "second double-click zooms back out");
         double_click(&mut h);
         assert!(h.app.zoom.is_some(), "third double-click zooms in again");
+    }
+
+    /// Missing Windows extensions get a specific message; other failures don't.
+    #[test]
+    fn codec_help_names_the_missing_extension() {
+        let failed = format!("{}something", crate::wic::DECODE_FAILED);
+        assert_eq!(codec_help(Path::new(r"C:\x\IMG_1.HEIC"), crate::wic::NO_READER), Some(HEIF_EXTENSION));
+        assert_eq!(codec_help(Path::new(r"C:\x\IMG_1.heif"), &failed), Some(HEVC_EXTENSION));
+        assert_eq!(codec_help(Path::new(r"C:\x\pic.avif"), crate::wic::NO_READER), Some(AV1_EXTENSION));
+        assert_eq!(codec_help(Path::new(r"C:\x\IMG_1.JPG"), "bad JPEG"), None);
+        assert_eq!(codec_help(Path::new(r"C:\x\IMG_1.HEIC"), "file not found"), None);
+        assert_eq!(HEIF_EXTENSION.short, "Needs HEIC reader");
     }
 
     /// A GIF in the viewer shows the frame due at each moment, looping.

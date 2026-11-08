@@ -5,6 +5,13 @@
 
 use std::path::Path;
 
+/// Error when Windows has no decoder for the file's format at all (for HEIC: the HEIF
+/// Image Extensions isn't installed).
+pub const NO_READER: &str = "No Windows reader for this image type";
+/// Error prefix when Windows has a decoder but it failed (for HEIC usually because
+/// HEVC Video Extensions is missing, or the file is damaged).
+pub const DECODE_FAILED: &str = "Windows couldn't decode this image: ";
+
 /// A decoded image: RGBA pixels, size, the photo's full size, and its EXIF orientation.
 pub struct Decoded {
     pub rgba: Vec<u8>,
@@ -27,7 +34,7 @@ pub fn decode(path: &Path, max: [u32; 2]) -> Result<Decoded, String> {
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
     use windows::Win32::System::Variant::VT_UI2;
 
-    let err = |e: windows::core::Error| e.message().to_string();
+    let err = |e: windows::core::Error| format!("{DECODE_FAILED}{}", e.message());
     // SAFETY: COM calls on this thread (initialized here; a decode worker thread may
     // already be initialized, which is fine). Buffers passed to CopyPixels are sized
     // exactly stride × height.
@@ -36,9 +43,23 @@ pub fn decode(path: &Path, max: [u32; 2]) -> Result<Decoded, String> {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).map_err(err)?;
         let name = HSTRING::from(path.as_os_str());
-        let decoder = factory
-            .CreateDecoderFromFilename(PCWSTR(name.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
-            .map_err(|e| format!("No Windows decoder for this file (for HEIC, install HEIF Image Extensions): {}", e.message()))?;
+        let decoder = match factory.CreateDecoderFromFilename(
+            PCWSTR(name.as_ptr()),
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        ) {
+            Ok(d) => d,
+            // No decoder took the file. If Windows has no HEIF decoder at all, the
+            // reader is missing; otherwise this file is the problem.
+            Err(e) => {
+                let is_heif = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("heic") || e.eq_ignore_ascii_case("heif"));
+                return Err(if is_heif && !has_heif_reader(&factory) { NO_READER.to_string() } else { err(e) });
+            }
+        };
         let frame = decoder.GetFrame(0).map_err(err)?;
         let (mut w, mut h) = (0u32, 0u32);
         frame.GetSize(&mut w, &mut h).map_err(err)?;
@@ -86,6 +107,14 @@ pub fn decode(path: &Path, max: [u32; 2]) -> Result<Decoded, String> {
     }
 }
 
+/// Whether Windows has a HEIF decoder (the HEIF Image Extensions).
+#[cfg(windows)]
+fn has_heif_reader(factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory) -> bool {
+    use windows::Win32::Graphics::Imaging::GUID_ContainerFormatHeif;
+    // SAFETY: asks the factory for a decoder by container format.
+    unsafe { factory.CreateDecoder(&GUID_ContainerFormatHeif, std::ptr::null()).is_ok() }
+}
+
 #[cfg(not(windows))]
 pub fn decode(_path: &Path, _max: [u32; 2]) -> Result<Decoded, String> {
     Err("HEIC needs Windows' image decoders".into())
@@ -94,6 +123,31 @@ pub fn decode(_path: &Path, _max: [u32; 2]) -> Result<Decoded, String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    /// With a HEIC reader installed (as on this PC), a damaged HEIC reports a failed
+    /// decode — not a missing reader, which would wrongly send the user to the Store
+    /// for something they already have.
+    #[test]
+    fn damaged_heic_is_not_reported_as_missing_reader() {
+        let path = std::env::temp_dir().join(format!("cullery-wic-bad-{}.heic", std::process::id()));
+        std::fs::write(&path, b"definitely not a HEIC file").unwrap();
+        let result = decode(&path, [100, 100]);
+        std::fs::remove_file(&path).unwrap();
+        let reason = result.err().expect("garbage shouldn't decode");
+        // SAFETY: COM setup and a factory query.
+        let has_reader = unsafe {
+            use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
+            use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
+            has_heif_reader(&factory)
+        };
+        if has_reader {
+            assert!(reason.starts_with(DECODE_FAILED), "got: {reason}");
+        } else {
+            assert_eq!(reason, NO_READER);
+        }
+    }
 
     /// Encodes a test image as HEIC with Windows' own encoder (when the HEIF extension
     /// is installed), then decodes it at reduced size.

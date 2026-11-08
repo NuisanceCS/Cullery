@@ -43,6 +43,22 @@ pub fn set_backdrop(hwnd: isize, mica: bool, dark: bool) -> bool {
     }
 }
 
+/// Opens a link (here: a Microsoft Store page) with whatever Windows uses for it.
+#[cfg(windows)]
+pub fn open_link(url: &str) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, target) = (HSTRING::from("open"), HSTRING::from(url));
+    // SAFETY: asks the shell to open a fixed URL; no pointers outlive the call.
+    unsafe {
+        ShellExecuteW(None, &verb, &target, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_link(_url: &str) {}
+
 #[cfg(not(windows))]
 pub fn set_backdrop(_hwnd: isize, _mica: bool, _dark: bool) -> bool {
     false
