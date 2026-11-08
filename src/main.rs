@@ -24,7 +24,12 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true)
             // See-through where nothing is drawn, so the Windows 11 Mica backdrop can
             // show in the top bar. Every other theme paints the whole window.
-            .with_transparent(true),
+            .with_transparent(true)
+            // Shown until the window swaps in the sharper per-size icons (window.rs).
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
+                    .expect("the icon is a valid PNG"),
+            ),
         ..Default::default()
     };
     eframe::run_native("Cullery", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

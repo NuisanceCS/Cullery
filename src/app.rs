@@ -259,6 +259,9 @@ impl App {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
             _ => None,
         });
+        if let Some(hwnd) = app.hwnd {
+            crate::window::set_icons(hwnd);
+        }
         let theme = app.settings.theme;
         app.set_theme(&cc.egui_ctx, theme);
         app

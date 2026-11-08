@@ -43,6 +43,39 @@ pub fn set_backdrop(hwnd: isize, mica: bool, dark: bool) -> bool {
     }
 }
 
+/// Gives the window Cullery's icon from the one built into the exe, at the sizes this
+/// display uses for the title bar and the taskbar (Windows picks each from the icon
+/// file's sizes, so they're sharp rather than scaled down from one picture).
+#[cfg(windows)]
+pub fn set_icons(hwnd: isize) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXICON,
+        SM_CXSMICON, WM_SETICON,
+    };
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: loads icon resource 1 (added by build.rs) from our own exe and hands
+    // it to our own window; Windows keeps the icons for the life of the process.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else { return };
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        for (which, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+            let size = GetSystemMetrics(metric) * dpi / 96;
+            // MAKEINTRESOURCE(1)
+            let name = PCWSTR(1 as *const u16);
+            if let Ok(icon) = LoadImageW(Some(module.into()), name, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(which as usize)), Some(LPARAM(icon.0 as isize)));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_icons(_hwnd: isize) {}
+
 /// Opens a link (here: a Microsoft Store page) with whatever Windows uses for it.
 #[cfg(windows)]
 pub fn open_link(url: &str) {

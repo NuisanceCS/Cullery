@@ -61,6 +61,17 @@ $env:CULLERY_RAW_SAMPLES='F:\DCIM\100CANON'; cargo test --release raw -- --nocap
 ```
 Settings live in `%APPDATA%\Cullery\settings.txt`.
 
+## Icon
+
+The artwork is `assets\icon-artwork.png` (1024 × 1024). After changing it, run
+
+```
+powershell -ExecutionPolicy Bypass -File tools\make-icon.ps1
+```
+
+to add the light rim and remake `assets\cullery.ico` (every size Windows uses), then
+rebuild; `build.rs` puts the icon into `cullery.exe`.
+
 ## Test photos
 
 ```
