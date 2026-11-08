@@ -66,7 +66,7 @@ const VIEWER_KEYS: &[(&str, &str)] = &[
     ("Scroll wheel", "Zoom around the cursor"),
     ("Double-click", "Zoom to that spot, or back to fit"),
     ("Drag", "Move around while zoomed"),
-    ("Esc", "Back to the grid"),
+    ("Esc  /  Mouse back button", "Back to the grid"),
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -164,6 +164,8 @@ pub struct App {
     drawn_tiles: Vec<(Item, Rect)>,
     /// Last plain click on a tile (shot, time), for spotting double-clicks.
     last_tile_click: Option<(usize, f64)>,
+    /// Last click on the viewer's photo (time, position), for double-click zoom.
+    last_viewer_click: Option<(f64, Pos2)>,
     /// Longest gap between the clicks of a double-click, from Windows' setting.
     double_click_time: f64,
     /// The settings window, and which page it shows.
@@ -259,6 +261,7 @@ impl App {
             pending_scroll: None,
             drawn_tiles: Vec::new(),
             last_tile_click: None,
+            last_viewer_click: None,
             double_click_time,
             settings_page: None,
             view_picked: false,
@@ -468,6 +471,7 @@ impl App {
     }
 
     fn reset_zoom(&mut self) {
+        self.last_viewer_click = None;
         self.zoom = None;
         self.zoom_percent = None;
     }
@@ -1420,8 +1424,19 @@ impl App {
             (Some(full), Some(orig)) => {
                 let fit = (area.width() / orig.x).min(area.height() / orig.y);
 
-                // Double-click: zoom to 100% at that spot, or back to fit.
-                if resp.double_clicked() {
+                // Double-click: zoom to 100% at that spot, or back to fit. Spotted here from
+                // two clicks in a row: egui's own detection counts a third click within
+                // about a second as a triple-click, so a quick second zoom was ignored.
+                let mut double = false;
+                if resp.clicked() {
+                    let now = ui.input(|i| i.time);
+                    let pos = resp.interact_pointer_pos().unwrap_or(area.center());
+                    double = self
+                        .last_viewer_click
+                        .is_some_and(|(t, p)| now - t <= self.double_click_time && p.distance(pos) <= 12.0);
+                    self.last_viewer_click = if double { None } else { Some((now, pos)) };
+                }
+                if double {
                     if self.zoom.is_some() {
                         self.zoom = None;
                     } else if let Some(pos) = resp.interact_pointer_pos() {
@@ -1599,6 +1614,8 @@ impl App {
 
         #[derive(Default)]
         struct Keys {
+            /// The mouse's back button (usually "Mouse 4", the side button nearer you).
+            back: bool,
             open: bool,
             export: bool,
             select_all: bool,
@@ -1621,10 +1638,12 @@ impl App {
             pick: !i.modifiers.command && (i.key_pressed(KeyCode::P) || i.key_pressed(KeyCode::Space)),
             home: i.key_pressed(KeyCode::Home),
             end: i.key_pressed(KeyCode::End),
+            back: i.pointer.button_pressed(egui::PointerButton::Extra1),
         });
-        // While Settings is open, keys don't reach the grid or viewer; Esc closes it.
+        // While Settings is open, keys don't reach the grid or viewer; Esc or the mouse
+        // back button closes it.
         if self.settings_page.is_some() {
-            if k.esc {
+            if k.esc || k.back {
                 self.settings_page = None;
             }
             k = Keys::default();
@@ -1637,7 +1656,7 @@ impl App {
         }
         match self.screen {
             Screen::Viewer if !self.shots.is_empty() => {
-                if k.esc {
+                if k.esc || k.back {
                     self.back_to_grid();
                 }
                 if k.left {
@@ -2441,6 +2460,56 @@ mod tests {
         assert_eq!(drop_hint(&[photo], &own), None);
 
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// Double-click zoom in the viewer works every time, with no cooldown: zoom in,
+    /// out and in again in quick succession. (egui's own detection counted the third
+    /// click within about a second as a triple-click and ignored it.)
+    #[test]
+    fn viewer_double_click_zoom_has_no_cooldown() {
+        let mut h = Harness::new();
+        h.app.open_viewer(5);
+        let image = egui::ColorImage::new([1200, 800], vec![Color32::GRAY; 1200 * 800]);
+        let tex = h.ctx.load_texture("full", image, TextureOptions::LINEAR);
+        h.app.fulls.insert(5, FullImage { tex, original: vec2(6000.0, 4000.0) });
+        h.frame(vec![], 0.016);
+        let pos = h.ctx.screen_rect().center();
+
+        let double_click = |h: &mut Harness| {
+            h.frame(vec![Event::PointerMoved(pos)], 0.016);
+            h.frame(vec![Harness::button(pos, true)], 0.06);
+            h.frame(vec![Harness::button(pos, false)], 0.12);
+            h.frame(vec![Harness::button(pos, true)], 0.06);
+            h.frame(vec![Harness::button(pos, false)], 0.016);
+            h.frame(vec![], 0.15);
+        };
+        double_click(&mut h);
+        assert!(h.app.zoom.is_some(), "first double-click zooms in");
+        double_click(&mut h);
+        assert!(h.app.zoom.is_none(), "second double-click zooms back out");
+        double_click(&mut h);
+        assert!(h.app.zoom.is_some(), "third double-click zooms in again");
+    }
+
+    /// The mouse back button leaves the viewer, and closes Settings.
+    #[test]
+    fn mouse_back_button_goes_back() {
+        let back = |pressed| Event::PointerButton {
+            pos: pos2(600.0, 400.0),
+            button: egui::PointerButton::Extra1,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut h = Harness::new();
+        h.app.open_viewer(5);
+        h.frame(vec![], 0.016);
+        h.frame(vec![back(true)], 0.016);
+        h.frame(vec![back(false)], 0.016);
+        assert!(h.app.screen == Screen::Grid);
+
+        h.app.settings_page = Some(SettingsPage::Themes);
+        h.frame(vec![back(true)], 0.016);
+        assert!(h.app.settings_page.is_none());
     }
 
     /// Esc closes Settings and nothing else: the grid selection behind it stays.
