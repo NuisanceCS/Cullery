@@ -4,6 +4,8 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::theme::ThemeId;
+
 /// `%APPDATA%\Cullery`, where settings and picks live.
 ///
 /// The app was called Culler at first; the first run under the new name moves that
@@ -30,6 +32,7 @@ pub struct Settings {
     pub show_raw: bool,
     pub tile_width: f32,
     pub drag_files: DragFiles,
+    pub theme: ThemeId,
 }
 
 /// Which of a shot's files go along when photos are dragged out of Cullery.
@@ -72,7 +75,14 @@ impl DragFiles {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { export_dir: None, recent: Vec::new(), show_raw: false, tile_width: 190.0, drag_files: DragFiles::Raw }
+        Self {
+            export_dir: None,
+            recent: Vec::new(),
+            show_raw: false,
+            tile_width: 190.0,
+            drag_files: DragFiles::Raw,
+            theme: ThemeId::AppleDark,
+        }
     }
 }
 
@@ -92,6 +102,11 @@ impl Settings {
                 "export" if !value.is_empty() => s.export_dir = Some(PathBuf::from(value)),
                 "recent" if !value.is_empty() => s.recent.push(PathBuf::from(value)),
                 "show_raw" => s.show_raw = value == "1",
+                "theme" => {
+                    if let Some(t) = ThemeId::from_key(value) {
+                        s.theme = t;
+                    }
+                }
                 "drag_files" => {
                     if let Some(d) = DragFiles::ALL.into_iter().find(|d| d.key() == value) {
                         s.drag_files = d;
@@ -121,6 +136,7 @@ impl Settings {
         text += &format!("show_raw={}\n", if self.show_raw { 1 } else { 0 });
         text += &format!("tile_width={}\n", self.tile_width.round());
         text += &format!("drag_files={}\n", self.drag_files.key());
+        text += &format!("theme={}\n", self.theme.key());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }

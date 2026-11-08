@@ -17,7 +17,7 @@ use crate::library::{self, Shot};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
 use crate::settings::{DragFiles, Settings};
-use crate::theme::{self, Palette};
+use crate::theme::{self, Palette, ThemeId};
 
 /// Grid thumbnails kept in memory; the least recently seen are dropped beyond this.
 const MAX_THUMBS: usize = 700;
@@ -137,6 +137,8 @@ struct LayoutKey {
 pub struct App {
     p: Palette,
     settings: Settings,
+    /// The Windows 11 Mica backdrop is showing (the top bar is see-through to it).
+    mica_active: bool,
     loader: Loader,
     generation: u64,
     exporter: Exporter,
@@ -204,11 +206,30 @@ impl App {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
             _ => None,
         });
+        let theme = app.settings.theme;
+        app.set_theme(&cc.egui_ctx, theme);
         app
     }
 
+    /// Switches theme: colors and shapes, the title bar's light/dark mode, and the
+    /// Windows 11 Mica backdrop.
+    fn set_theme(&mut self, ctx: &egui::Context, id: ThemeId) {
+        if self.settings.theme != id {
+            self.settings.theme = id;
+            self.settings.save();
+        }
+        self.p = id.palette();
+        theme::apply(ctx, &self.p);
+        self.mica_active = match self.hwnd {
+            Some(hwnd) => crate::window::set_backdrop(hwnd, self.p.mica, self.p.dark),
+            None => false,
+        };
+        ctx.request_repaint();
+    }
+
     fn with_context(ctx: &egui::Context) -> Self {
-        let p = theme::DARK;
+        let settings = Settings::load();
+        let p = settings.theme.palette();
         theme::apply(ctx, &p);
         // egui allows only 0.3 s between the clicks of a double-click (Windows: 0.5 s by
         // default), measured end to end, so normal double-clicks often went unnoticed.
@@ -217,7 +238,8 @@ impl App {
         let ctx = ctx.clone();
         Self {
             p,
-            settings: Settings::load(),
+            settings,
+            mica_active: false,
             loader: Loader::new(ctx.clone()),
             generation: 0,
             exporter: Exporter::new(ctx.clone()),
@@ -645,7 +667,8 @@ impl App {
     fn top_bar(&mut self, ctx: &egui::Context) {
         let p = self.p;
         egui::TopBottomPanel::top("top")
-            .frame(Frame::new().fill(p.bar).inner_margin(Margin::symmetric(14, 9)))
+            // With Mica, the top bar is left see-through so Windows draws the wallpaper tint.
+            .frame(Frame::new().fill(if self.mica_active { Color32::TRANSPARENT } else { p.bar }).inner_margin(Margin::symmetric(14, 9)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.set_min_height(32.0);
@@ -744,7 +767,7 @@ impl App {
             }
         };
         let button = Button::new(job)
-            .corner_radius(15)
+            .corner_radius(p.r_pill)
             .fill(p.control)
             .stroke(Stroke::new(1.0_f32, p.control_border));
         if ui.add(button).on_hover_text(tip).clicked() {
@@ -789,7 +812,7 @@ impl App {
         self.quick_export_button(ui, !self.selected.is_empty());
 
         let selecting = self.range_mode != RangeMode::Off;
-        let mut range_btn = Button::new(RichText::new("Select Range").color(if selecting { Color32::WHITE } else { p.label }));
+        let mut range_btn = Button::new(RichText::new("Select Range").color(if selecting { p.on_accent } else { p.label }));
         if selecting {
             range_btn = range_btn.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
         }
@@ -829,7 +852,7 @@ impl App {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // View Picked (rightmost): show only picked photos.
             let on = self.view_picked;
-            let mut b = Button::new(RichText::new("View Picked").color(if on { Color32::WHITE } else { p.label }));
+            let mut b = Button::new(RichText::new("View Picked").color(if on { p.on_accent } else { p.label }));
             if on {
                 b = b.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
             }
@@ -928,7 +951,7 @@ impl App {
         }
         Frame::new()
             .fill(p.tint_bg)
-            .corner_radius(15)
+            .corner_radius(p.r_pill)
             .inner_margin(Margin::symmetric(12, 6))
             .show(ui, |ui| ui.label(RichText::new(text).color(p.tint).font(theme::font_semibold(13.5))));
     }
@@ -1014,10 +1037,10 @@ impl App {
                 ui.label(RichText::new("No Folder Open").font(theme::font_semibold(22.0)));
                 ui.label(RichText::new("Drop a folder or SD card here, or open one to start culling.").color(p.label2).size(14.0));
                 ui.add_space(8.0);
-                let open_btn = Button::new(RichText::new("Open Folder…    Ctrl O").color(Color32::WHITE).font(theme::font_semibold(14.0)))
+                let open_btn = Button::new(RichText::new("Open Folder…    Ctrl O").color(p.on_accent).font(theme::font_semibold(14.0)))
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
-                    .corner_radius(18)
+                    .corner_radius(p.r_pill)
                     .min_size(vec2(0.0, 36.0));
                 if ui.add(open_btn).clicked() {
                     self.choose_folder(ctx);
@@ -1245,7 +1268,7 @@ impl App {
         };
         Frame::new()
             .fill(p.card)
-            .corner_radius(10)
+            .corner_radius(p.r_card)
             .inner_margin(Margin { left: 14, right: 6, top: 6, bottom: 6 })
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -1294,23 +1317,24 @@ impl App {
         // Selection: a soft box around the whole tile, like Finder / Explorer.
         if selected {
             let sel = Rect::from_min_max(thumb_rect.min - vec2(6.0, 6.0), pos2(thumb_rect.max.x + 6.0, rect.max.y + 2.0));
-            painter.rect_filled(sel, 9, Color32::from_white_alpha(28));
-            painter.rect_stroke(sel, 9, Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Inside);
+            let r = theme::around(p.r_thumb, 3);
+            painter.rect_filled(sel, r, p.select_bg);
+            painter.rect_stroke(sel, r, Stroke::new(1.0_f32, p.select_border), StrokeKind::Inside);
         }
-        painter.rect_filled(thumb_rect, 6, p.tile);
+        painter.rect_filled(thumb_rect, p.r_thumb, p.tile);
         if let Some(t) = self.thumbs.get_mut(&item.shot) {
             t.last_used = self.frame;
             let fit = fit_rect(thumb_rect, t.tex.size_vec2());
-            Image::new((t.tex.id(), fit.size())).corner_radius(4).paint_at(ui, fit);
+            Image::new((t.tex.id(), fit.size())).corner_radius(p.r_thumb.saturating_sub(2)).paint_at(ui, fit);
         } else if self.failed.contains(&Key { shot: item.shot, kind: Kind::Thumb }) {
             painter.text(thumb_rect.center(), Align2::CENTER_CENTER, "No preview", theme::font(12.0), p.label2);
         }
         let hovered = resp.hovered() || circle.as_ref().is_some_and(|c| c.hovered());
         if resp.hovered() {
-            painter.rect_filled(thumb_rect, 6, Color32::from_white_alpha(12));
+            painter.rect_filled(thumb_rect, p.r_thumb, Color32::from_white_alpha(12));
         }
         if picked || is_start {
-            painter.rect_stroke(thumb_rect, 7, Stroke::new(3.0_f32, p.accent), StrokeKind::Outside);
+            painter.rect_stroke(thumb_rect, theme::around(p.r_thumb, 1), Stroke::new(3.0_f32, p.accent), StrokeKind::Outside);
         }
 
         // File type badge (top-left).
@@ -1321,7 +1345,7 @@ impl App {
         };
         let galley = painter.layout_no_wrap(badge.into(), theme::font_semibold(10.0), fg);
         let badge_rect = Rect::from_min_size(thumb_rect.min + vec2(8.0, 8.0), galley.size() + vec2(10.0, 4.0));
-        painter.rect_filled(badge_rect, 4, bg);
+        painter.rect_filled(badge_rect, p.r_ctl.min(4), bg);
         painter.galley(badge_rect.min + vec2(5.0, 2.0), galley, fg);
 
         if circle.is_some() && (picked || hovered) {
@@ -1329,7 +1353,7 @@ impl App {
             if picked {
                 painter.circle_filled(c, 12.0, p.accent);
                 painter.circle_stroke(c, 12.0, Stroke::new(2.0_f32, Color32::WHITE));
-                check_mark(painter, c, 5.5, Color32::WHITE);
+                check_mark(painter, c, 5.5, p.on_accent);
             } else {
                 painter.circle_filled(c, 12.0, Color32::from_black_alpha(80));
                 painter.circle_stroke(c, 12.0, Stroke::new(1.5_f32, Color32::from_white_alpha(230)));
@@ -1338,22 +1362,23 @@ impl App {
 
         if selecting && hovered {
             let text = if is_start { "Start" } else if matches!(self.range_mode, RangeMode::PickStart) { "Set Start" } else { "Set End" };
-            let g = painter.layout_no_wrap(text.into(), theme::font_semibold(13.0), Color32::WHITE);
+            let mark_text = if is_start { p.on_accent } else { Color32::WHITE };
+            let g = painter.layout_no_wrap(text.into(), theme::font_semibold(13.0), mark_text);
             let r = Rect::from_center_size(thumb_rect.center(), g.size() + vec2(24.0, 12.0));
-            painter.rect_filled(r, 14, if is_start { p.accent } else { Color32::from_black_alpha(160) });
-            painter.galley(r.min + vec2(12.0, 6.0), g, Color32::WHITE);
+            painter.rect_filled(r, p.r_pill.min(14), if is_start { p.accent } else { Color32::from_black_alpha(160) });
+            painter.galley(r.min + vec2(12.0, 6.0), g, mark_text);
         }
 
         // File name, with a blue highlight when selected (like Finder).
         let name = if item.raw { shot.raw_name() } else { shot.jpg_name() };
-        let name_color = if selected { Color32::WHITE } else { p.label };
+        let name_color = if selected { p.on_accent } else { p.label };
         let g = painter.layout_no_wrap(name, theme::font(12.5), name_color);
         let name_rect = Rect::from_center_size(
             pos2(thumb_rect.center().x, thumb_rect.max.y + 16.0),
             g.size() + vec2(12.0, 2.0),
         );
         if selected {
-            painter.rect_filled(name_rect, 5, p.accent);
+            painter.rect_filled(name_rect, p.r_ctl.min(5), p.accent);
         }
         painter.galley(name_rect.min + vec2(6.0, 1.0), g, name_color);
         let sub = match (item.raw, shot.jpg.is_some(), shot.raw.is_some()) {
@@ -1484,7 +1509,7 @@ impl App {
             painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
             let c = pos2(r.min.x + 17.0, r.center().y);
             painter.circle_filled(c, 10.0, p.accent);
-            check_mark(painter, c, 4.5, Color32::WHITE);
+            check_mark(painter, c, 4.5, p.on_accent);
             painter.galley(pos2(r.min.x + 34.0, r.min.y + 7.0), g, Color32::WHITE);
         }
 
@@ -1546,7 +1571,7 @@ impl App {
         painter.rect_stroke(r, CornerRadius::same(18), Stroke::new(1.0_f32, Color32::from_white_alpha(30).gamma_multiply(alpha)), StrokeKind::Inside);
         let c = pos2(r.min.x + 20.0, r.center().y);
         painter.circle_filled(c, 10.0, p.accent.gamma_multiply(alpha));
-        check_mark(&painter, c, 4.5, white);
+        check_mark(&painter, c, 4.5, p.on_accent.gamma_multiply(alpha));
         painter.galley(pos2(r.min.x + 38.0, r.center().y - g.size().y / 2.0), g, white);
         ctx.request_repaint();
     }
@@ -1555,6 +1580,12 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_ui(ctx);
+    }
+
+    /// Clear to fully transparent: every panel paints itself, except the top bar
+    /// under Windows 11 Mica, which must stay see-through.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
     }
 }
 
@@ -1686,15 +1717,16 @@ impl App {
         let screen = ctx.screen_rect();
         let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("drop-overlay")));
         painter.rect_filled(screen, 0, Color32::from_black_alpha(150));
-        painter.rect_stroke(screen.shrink(3.0), 8, Stroke::new(2.0_f32, p.accent), StrokeKind::Inside);
+        painter.rect_stroke(screen.shrink(3.0), p.r_card.min(8), Stroke::new(2.0_f32, p.accent), StrokeKind::Inside);
 
         let title_g = painter.layout_no_wrap(title, theme::font_semibold(16.0), p.label);
         let detail_g = detail.map(|d| painter.layout_no_wrap(d, theme::font(13.0), p.label2));
         let width = title_g.size().x.max(detail_g.as_ref().map_or(0.0, |g| g.size().x)) + 56.0;
         let height = 26.0 + title_g.size().y + detail_g.as_ref().map_or(0.0, |g| g.size().y + 6.0) + 26.0;
         let card = Rect::from_center_size(screen.center(), vec2(width, height));
-        painter.rect_filled(card, 12, p.card);
-        painter.rect_stroke(card, 12, Stroke::new(1.0_f32, p.accent), StrokeKind::Inside);
+        let r = theme::around(p.r_card, 2);
+        painter.rect_filled(card, r, p.card);
+        painter.rect_stroke(card, r, Stroke::new(1.0_f32, p.accent), StrokeKind::Inside);
         let mut y = card.min.y + 26.0;
         painter.galley(pos2(card.center().x - title_g.size().x / 2.0, y), title_g.clone(), p.label);
         y += title_g.size().y + 6.0;
@@ -1709,18 +1741,23 @@ impl App {
         let Some(page) = self.settings_page else { return };
         let p = self.p;
         let mut open = true;
+        let mut chosen_theme = None;
+        // Every page gets the same fixed area (long pages scroll inside it), so the
+        // window keeps one size when switching pages.
+        const SIDEBAR_W: f32 = 140.0;
+        const PAGE: Vec2 = vec2(460.0, 420.0);
         egui::Window::new(RichText::new("Settings").font(theme::font_semibold(15.0)))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(vec2(620.0, 430.0))
-            .frame(Frame::window(&ctx.style()).fill(p.card).inner_margin(Margin::same(16)))
+            .frame(Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(16)))
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     // Sidebar.
                     ui.vertical(|ui| {
-                        ui.set_width(140.0);
+                        ui.set_width(SIDEBAR_W);
+                        ui.set_min_height(PAGE.y);
                         let pages = [
                             (SettingsPage::Keybinds, "Keybinds"),
                             (SettingsPage::DragDrop, "Drag & Drop"),
@@ -1728,11 +1765,11 @@ impl App {
                         ];
                         for (target, label) in pages {
                             let on = page == target;
-                            let b = Button::new(RichText::new(label).color(if on { Color32::WHITE } else { p.label }))
+                            let b = Button::new(RichText::new(label).color(if on { p.on_accent } else { p.label }))
                                 .fill(if on { p.accent } else { Color32::TRANSPARENT })
                                 .stroke(Stroke::NONE)
-                                .corner_radius(theme::RADIUS)
-                                .min_size(vec2(140.0, 32.0));
+                                .corner_radius(p.r_ctl)
+                                .min_size(vec2(SIDEBAR_W, 32.0));
                             if ui.add(b).clicked() {
                                 self.settings_page = Some(target);
                             }
@@ -1741,13 +1778,20 @@ impl App {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.vertical(|ui| match page {
-                        SettingsPage::Keybinds => keybinds_page(ui, &p),
-                        SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
-                        SettingsPage::Themes => themes_page(ui, &p),
+                    ui.allocate_ui_with_layout(PAGE, Layout::top_down(Align::Min), |ui| {
+                        ui.set_min_size(PAGE);
+                        ui.set_max_size(PAGE);
+                        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match page {
+                            SettingsPage::Keybinds => keybinds_page(ui, &p),
+                            SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
+                            SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.settings.theme),
+                        });
                     });
                 });
             });
+        if let Some(theme) = chosen_theme {
+            self.set_theme(ctx, theme);
+        }
         if !open {
             self.settings_page = None;
         }
@@ -1755,20 +1799,18 @@ impl App {
 }
 
 fn keybinds_page(ui: &mut Ui, p: &Palette) {
-    ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
-        for (title, keys) in [("Grid", GRID_KEYS), ("Viewer", VIEWER_KEYS)] {
-            ui.label(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label2));
-            egui::Grid::new(title).num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
-                for (key, action) in keys {
-                    ui.label(RichText::new(*key).font(theme::font_semibold(13.0)));
-                    ui.label(RichText::new(*action).color(p.label2));
-                    ui.end_row();
-                }
-            });
-            ui.add_space(12.0);
-        }
-        ui.label(RichText::new("Changing keybinds is coming soon.").color(p.label2).italics());
-    });
+    for (title, keys) in [("Grid", GRID_KEYS), ("Viewer", VIEWER_KEYS)] {
+        ui.label(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label2));
+        egui::Grid::new(title).num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
+            for (key, action) in keys {
+                ui.label(RichText::new(*key).font(theme::font_semibold(13.0)));
+                ui.label(RichText::new(*action).color(p.label2));
+                ui.end_row();
+            }
+        });
+        ui.add_space(12.0);
+    }
+    ui.label(RichText::new("Changing keybinds is coming soon.").color(p.label2).italics());
 }
 
 fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
@@ -1800,33 +1842,58 @@ fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
     );
 }
 
-fn themes_page(ui: &mut Ui, p: &Palette) {
+/// A card per theme, drawn in that theme's own colors and corner style. Returns the
+/// theme clicked, if any.
+fn themes_page(ui: &mut Ui, p: &Palette, current: ThemeId) -> Option<ThemeId> {
+    let mut chosen = None;
     ui.label(RichText::new("Theme").font(theme::font_semibold(13.5)).color(p.label2));
-    ui.add_space(4.0);
-    // The one theme so far, shown as selected.
-    Frame::new()
-        .fill(p.bg)
-        .stroke(Stroke::new(2.0_f32, p.accent))
-        .corner_radius(10)
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(220.0);
-            ui.horizontal(|ui| {
-                for c in [p.bar, p.control, p.label2, p.accent] {
-                    let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-                    ui.painter().circle_filled(r.center(), 10.0, c);
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new("Dark (Apple)").font(theme::font_semibold(13.5)));
-            ui.label(RichText::new("Current theme").color(p.label2));
-        });
-    ui.add_space(14.0);
+    ui.add_space(6.0);
+    egui::Grid::new("themes").num_columns(2).spacing(vec2(12.0, 12.0)).show(ui, |ui| {
+        for (i, id) in ThemeId::ALL.into_iter().enumerate() {
+            if theme_card(ui, p, id, id == current).clicked() && id != current {
+                chosen = Some(id);
+            }
+            if i % 2 == 1 {
+                ui.end_row();
+            }
+        }
+    });
+    ui.add_space(12.0);
     ui.label(
-        RichText::new("More themes, including a Windows-style one, and ways to customize them are coming soon.")
+        RichText::new("Windows 11 themes show your wallpaper's tint (Mica) in the top bar.")
             .color(p.label2)
             .italics(),
     );
+    chosen
+}
+
+/// A small preview of a theme: its top bar, a photo tile, an accent button.
+fn theme_card(ui: &mut Ui, p: &Palette, id: ThemeId, selected: bool) -> Response {
+    let t = id.palette();
+    let (rect, resp) = ui.allocate_exact_size(vec2(210.0, 118.0), Sense::click());
+    let painter = ui.painter();
+    let r = t.r_card.min(10);
+    painter.rect_filled(rect, r, t.bg);
+    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 22.0));
+    let bar_fill = if t.mica { t.mica_preview } else { t.bar };
+    painter.rect_filled(bar, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, bar_fill);
+    for i in 0..3 {
+        let tile = Rect::from_min_size(rect.min + vec2(10.0 + i as f32 * 40.0, 30.0), vec2(34.0, 23.0));
+        painter.rect_filled(tile, t.r_thumb.min(4), t.tile);
+    }
+    let button = Rect::from_min_size(rect.min + vec2(130.0, 32.0), vec2(68.0, 18.0));
+    painter.rect_filled(button, t.r_pill.min(9), t.accent);
+    painter.text(rect.left_bottom() + vec2(10.0, -30.0), Align2::LEFT_CENTER, id.name(), theme::font_semibold(13.0), t.label);
+    painter.text(rect.left_bottom() + vec2(10.0, -13.0), Align2::LEFT_CENTER, id.subtitle(), theme::font(11.5), t.label2);
+    let stroke = if selected {
+        Stroke::new(2.5_f32, p.accent)
+    } else if resp.hovered() {
+        Stroke::new(1.5_f32, p.label2)
+    } else {
+        Stroke::new(1.0_f32, p.control_border)
+    };
+    painter.rect_stroke(rect, r, stroke, StrokeKind::Outside);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 // -------------------------------------------------------------------- helpers
@@ -1957,17 +2024,18 @@ fn scrollbar(ui: &Ui, p: &Palette, rect: Rect, offset: f32, content_h: f32, view
     let w = if active || track_r.hovered() { 8.0 } else { 6.0 };
     let bar = Rect::from_center_size(thumb.center(), vec2(w, thumb_h - 2.0));
     let color = if thumb_r.dragged() {
-        Color32::from_gray(0xA8)
+        p.label2
     } else if active {
-        Color32::from_gray(0x8C)
+        p.scroll_hover
     } else {
-        Color32::from_gray(0x6A)
+        p.scroll
     };
-    painter.rect_filled(bar, CornerRadius::same((w / 2.0) as u8), color);
+    let radius = if p.r_ctl == 0 { 0 } else { (w / 2.0) as u8 };
+    painter.rect_filled(bar, CornerRadius::same(radius), color);
     for (r, resp, upward) in [(up, &up_r, true), (down, &down_r, false)] {
         let c = r.center();
         let s = 3.5;
-        let color = if resp.hovered() { p.label } else { Color32::from_gray(0x8A) };
+        let color = if resp.hovered() { p.label } else { p.scroll_hover };
         let (tip, base) = if upward { (-s * 0.6, s * 0.6) } else { (s * 0.6, -s * 0.6) };
         let points = vec![c + vec2(-s, base), c + vec2(s, base), c + vec2(0.0, tip)];
         painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
@@ -1982,8 +2050,11 @@ fn cog_button(ui: &mut Ui, p: &Palette, open: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
     let painter = ui.painter();
     if open || resp.hovered() {
-        let fill = if open { p.control } else { Color32::from_white_alpha(14) };
-        painter.rect_filled(rect, theme::RADIUS, fill);
+        let fill = if open { p.control } else { p.hover };
+        painter.rect_filled(rect, p.r_ctl, fill);
+        if let (Some(border), true) = (p.hover_border, resp.hovered()) {
+            painter.rect_stroke(rect, p.r_ctl, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+        }
     }
     let color = if open || resp.hovered() { p.label } else { p.label2 };
     let c = rect.center();
@@ -2006,15 +2077,15 @@ fn key_hint(size: f32, color: Color32) -> TextFormat {
 
 /// The big Pick button (grid and viewer). Filled blue once picked.
 fn pick_button(ui: &mut Ui, p: &Palette, label: &str, picked: bool, enabled: bool) -> Response {
-    let (fill, color) = if picked { (p.accent, Color32::WHITE) } else { (p.control, p.tint) };
+    let (fill, color) = if picked { (p.accent, p.on_accent) } else { (p.control, p.tint) };
     let mut job = LayoutJob::default();
     job.append(&format!("✔  {label}"), 0.0, TextFormat { font_id: theme::font_semibold(15.0), color, ..Default::default() });
-    let key_color = if picked { Color32::from_white_alpha(170) } else { p.label2 };
+    let key_color = if picked { p.on_accent.gamma_multiply(0.7) } else { p.label2 };
     job.append("   P", 0.0, key_hint(13.0, key_color));
     let button = Button::new(job)
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, if picked { p.accent } else { p.control_border }))
-        .corner_radius(22)
+        .corner_radius(p.r_pill)
         .min_size(vec2(PICK_W, 44.0));
     ui.add_enabled(enabled, button)
 }
@@ -2023,14 +2094,19 @@ fn chevron_button(ui: &mut Ui, p: &Palette, left: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
     let painter = ui.painter();
     let fill = if resp.is_pointer_button_down_on() {
-        theme::lighten(p.control, 24)
+        theme::shade(p, p.control, 24)
     } else if resp.hovered() {
-        theme::lighten(p.control, 12)
+        theme::shade(p, p.control, 12)
     } else {
         p.control
     };
-    painter.circle_filled(rect.center(), 22.0, fill);
-    painter.circle_stroke(rect.center(), 21.5, Stroke::new(1.0_f32, p.control_border));
+    // Round for Apple themes (radius clamps to a circle), rounded-square or square for Windows.
+    let border = match (p.hover_border, resp.hovered()) {
+        (Some(b), true) => b,
+        _ => p.control_border,
+    };
+    painter.rect_filled(rect, p.r_pill, fill);
+    painter.rect_stroke(rect, p.r_pill, Stroke::new(1.0_f32, border), StrokeKind::Inside);
     chevron(painter, rect.center(), 8.0, left, 2.4, p.label);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -2042,7 +2118,7 @@ fn back_button(ui: &mut Ui, p: &Palette, text: &str) -> Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     if resp.hovered() {
-        painter.rect_filled(rect, theme::RADIUS, Color32::from_white_alpha(14));
+        painter.rect_filled(rect, p.r_ctl, p.hover);
     }
     chevron(painter, pos2(rect.min.x + 14.0, rect.center().y), 9.0, true, 2.6, p.tint);
     painter.galley(pos2(rect.min.x + 28.0, rect.center().y - galley.size().y / 2.0), galley, p.tint);
@@ -2061,7 +2137,7 @@ fn segmented(ui: &mut Ui, p: &Palette, options: &[&str], selected: usize) -> Opt
     let mut clicked = None;
     Frame::new()
         .fill(p.segment_bg)
-        .corner_radius(8)
+        .corner_radius(theme::around(p.r_ctl, 1))
         .inner_margin(Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -2070,7 +2146,7 @@ fn segmented(ui: &mut Ui, p: &Palette, options: &[&str], selected: usize) -> Opt
                 let b = Button::new(RichText::new(*option).color(p.label))
                     .fill(if on { p.segment_on } else { Color32::TRANSPARENT })
                     .stroke(Stroke::NONE)
-                    .corner_radius(6)
+                    .corner_radius(p.r_ctl.saturating_sub(1))
                     .min_size(vec2(0.0, 26.0));
                 if ui.add(b).clicked() {
                     clicked = Some(i);
@@ -2094,8 +2170,8 @@ fn list_row(ui: &mut Ui, p: &Palette, title: &str, sub: Option<&str>, trailing: 
     let h = if sub.is_some() { 52.0 } else { 40.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
     let painter = ui.painter();
-    let fill = if resp.hovered() { theme::lighten(p.card, 10) } else { p.card };
-    painter.rect_filled(rect, CornerRadius::same(10), fill);
+    let fill = if resp.hovered() { theme::shade(p, p.card, 10) } else { p.card };
+    painter.rect_filled(rect, p.r_card, fill);
     let x = rect.min.x + 14.0;
     match sub {
         Some(sub) => {
