@@ -22,3 +22,13 @@ cargo build --release
 ```
 
 On Windows the app is a single file: `target\release\cullery.exe`. To make the Mac app and installer, run `bash tools/make-mac-app.sh` on a Mac.
+
+## Contributing
+
+Ideas and improvements are welcome. Open an issue or a pull request. Contributions are accepted under the same license as the project.
+
+## License
+
+Copyright © 2026 NuisanceCS. Cullery is free and open source under the [GNU General Public License v3](LICENSE).
+
+The name "Cullery" and the logo aren't covered by that license. If you distribute your own version, please give it its own name and logo. See [NOTICE](NOTICE).
