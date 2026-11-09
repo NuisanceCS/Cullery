@@ -16,6 +16,7 @@ use crate::export::{self, Done, Exporter};
 use crate::library::{self, Shot, SortBy};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
+use crate::platform;
 use crate::settings::{DragFiles, Settings};
 use crate::theme::{self, Palette, ThemeId};
 
@@ -809,7 +810,7 @@ impl App {
                         }
                     } else {
                         let label = if self.folder.is_some() { "🗁" } else { "🗁  Open Folder" };
-                        if ui.add(Button::new(label)).on_hover_text("Open folder (Ctrl+O)").clicked() {
+                        if ui.add(Button::new(label)).on_hover_text(platform::keys("Open folder (Ctrl+O)")).clicked() {
                             self.choose_folder(ctx);
                         }
                         self.recent_menu(ui, ctx);
@@ -987,7 +988,7 @@ impl App {
         let p = self.p;
         let mut job = LayoutJob::default();
         job.append("Quick Export", 0.0, TextFormat { font_id: theme::font(13.5), color: p.label, ..Default::default() });
-        job.append("   Ctrl E", 0.0, key_hint(12.0, p.label2));
+        job.append(&platform::keys("   Ctrl E"), 0.0, key_hint(12.0, p.label2));
         let tip = format!("Copy {} to the export folder", self.settings.export_files.label());
         if ui.add_enabled(enabled, Button::new(job)).on_hover_text(tip).clicked() {
             self.quick_export();
@@ -1207,9 +1208,9 @@ impl App {
             ),
         };
         let where_to = if permanent {
-            "Memory cards and network drives have no Recycle Bin: the files will be deleted permanently. This can't be undone."
+            format!("Memory cards and network drives have no {}: the files will be deleted permanently. This can't be undone.", platform::TRASH)
         } else {
-            "They'll go to the Recycle Bin, where you can restore them."
+            format!("They'll go to the {}, where you can restore them.", platform::TRASH)
         };
 
         let mut confirmed = false;
@@ -1282,7 +1283,7 @@ impl App {
         match result {
             Ok(()) => {
                 let n = shots.len();
-                let verb = if permanent { "Deleted" } else { "Moved to the Recycle Bin:" };
+                let verb = if permanent { "Deleted".to_string() } else { format!("Moved to the {}:", platform::TRASH) };
                 self.show_toast(ctx, format!("{verb} {n} {}", plural(n, "photo", "photos")));
             }
             Err(e) => self.error(e),
@@ -1316,7 +1317,7 @@ impl App {
             ui.add_space(12.0);
             ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(400.0).fill(p.accent).corner_radius(p.r_pill));
             ui.add_space(8.0);
-            let place = if d.permanent { "Deleting permanently" } else { "Moving to the Recycle Bin" };
+            let place = if d.permanent { "Deleting permanently".to_string() } else { format!("Moving to the {}", platform::TRASH) };
             ui.label(RichText::new(format!("{place}: {done} of {total} files")).color(p.label2));
         });
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -1479,7 +1480,7 @@ impl App {
                 ui.label(RichText::new("No Folder Open").font(theme::font_semibold(22.0)));
                 ui.label(RichText::new("Drop a folder or SD card here, or open one to start culling.").color(p.label2).size(14.0));
                 ui.add_space(8.0);
-                let open_btn = Button::new(RichText::new("Open Folder…    Ctrl O").color(p.on_accent).font(theme::font_semibold(14.0)))
+                let open_btn = Button::new(RichText::new(platform::keys("Open Folder…    Ctrl O")).color(p.on_accent).font(theme::font_semibold(14.0)))
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
                     .corner_radius(p.r_pill)
@@ -2116,7 +2117,8 @@ impl App {
             home: i.key_pressed(KeyCode::Home),
             end: i.key_pressed(KeyCode::End),
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
-            delete: i.key_pressed(KeyCode::Delete),
+            // The key marked "delete" on a Mac keyboard is the one egui calls Backspace.
+            delete: i.key_pressed(KeyCode::Delete) || (cfg!(target_os = "macos") && i.key_pressed(KeyCode::Backspace)),
             settings: i.modifiers.command && i.key_pressed(KeyCode::Comma),
         });
         // While the delete confirmation is up, it gets the keys (Esc cancels it); while
@@ -2329,7 +2331,7 @@ fn keybinds_page(ui: &mut Ui, p: &Palette) {
         ui.label(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label2));
         egui::Grid::new(title).num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
             for (key, action) in keys {
-                ui.label(RichText::new(*key).font(theme::font_semibold(13.0)));
+                ui.label(RichText::new(platform::keys(key)).font(theme::font_semibold(13.0)));
                 ui.label(RichText::new(*action).color(p.label2));
                 ui.end_row();
             }
@@ -2463,11 +2465,13 @@ fn themes_page(ui: &mut Ui, p: &Palette, current: ThemeId) -> Option<ThemeId> {
         }
     });
     ui.add_space(12.0);
-    ui.label(
-        RichText::new("Windows 11 themes show your wallpaper's tint (Mica) in the top bar.")
-            .color(p.label2)
-            .italics(),
-    );
+    if cfg!(windows) {
+        ui.label(
+            RichText::new("Windows 11 themes show your wallpaper's tint (Mica) in the top bar.")
+                .color(p.label2)
+                .italics(),
+        );
+    }
     chosen
 }
 

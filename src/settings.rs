@@ -7,14 +7,23 @@ use std::sync::OnceLock;
 use crate::library::SortBy;
 use crate::theme::ThemeId;
 
-/// `%APPDATA%\Cullery`, where settings and picks live.
+/// Where this system keeps apps' own files.
+fn app_data_base() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support"));
+    #[cfg(not(target_os = "macos"))]
+    Some(PathBuf::from(std::env::var_os("APPDATA")?))
+}
+
+/// The `Cullery` folder where settings and picks live: in `%APPDATA%` on Windows, and
+/// `~/Library/Application Support` on macOS.
 ///
 /// The app was called Culler at first; the first run under the new name moves that
 /// folder over so settings, recent folders and picks carry across.
 pub fn data_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let base = PathBuf::from(std::env::var_os("APPDATA")?);
+        let base = app_data_base()?;
         let dir = base.join("Cullery");
         let old = base.join("Culler");
         if !dir.exists() && old.is_dir() {

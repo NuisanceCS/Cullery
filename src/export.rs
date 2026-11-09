@@ -194,11 +194,26 @@ fn delete_files(files: &[PathBuf], permanent: bool, progress: impl Fn(usize)) ->
                 })?;
             }
         } else {
-            trash::delete_all(group).map_err(|e| format!("Couldn't move the photos to the Recycle Bin: {e}"))?;
+            move_to_trash(group).map_err(|e| format!("Couldn't move the photos to the {}: {e}", crate::platform::TRASH))?;
         }
         progress(group.len());
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn move_to_trash(files: &[PathBuf]) -> Result<(), trash::Error> {
+    trash::delete_all(files)
+}
+
+/// The library's default on macOS scripts the Finder, which asks for permission first
+/// and plays the trash sound for every group of a big delete.
+#[cfg(target_os = "macos")]
+fn move_to_trash(files: &[PathBuf]) -> Result<(), trash::Error> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos};
+    let mut context = trash::TrashContext::default();
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context.delete_all(files)
 }
 
 /// Whether `path` is somewhere Windows has no Recycle Bin: a removable drive (memory

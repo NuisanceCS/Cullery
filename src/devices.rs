@@ -45,11 +45,26 @@ pub fn watch(ctx: eframe::egui::Context) -> Arc<Mutex<Vec<CardFolder>>> {
     found
 }
 
+/// Where a memory card's DCIM folder could be.
+#[cfg(not(target_os = "macos"))]
+fn dcim_candidates() -> Vec<PathBuf> {
+    // A: and B: are floppy letters; C: is the system drive.
+    (b'D'..=b'Z').map(|letter| PathBuf::from(format!("{}:\\DCIM", letter as char))).collect()
+}
+
+/// Where a memory card's DCIM folder could be. The startup disk is listed in /Volumes
+/// too, but has no DCIM folder at its root.
+#[cfg(target_os = "macos")]
+fn dcim_candidates() -> Vec<PathBuf> {
+    let Ok(volumes) = std::fs::read_dir("/Volumes") else { return Vec::new() };
+    let mut candidates: Vec<PathBuf> = volumes.filter_map(|e| e.ok()).map(|e| e.path().join("DCIM")).collect();
+    candidates.sort();
+    candidates
+}
+
 fn scan() -> Vec<CardFolder> {
     let mut found = Vec::new();
-    // A: and B: are floppy letters; C: is the system drive.
-    for letter in b'D'..=b'Z' {
-        let dcim = PathBuf::from(format!("{}:\\DCIM", letter as char));
+    for dcim in dcim_candidates() {
         let Ok(entries) = std::fs::read_dir(&dcim) else { continue };
         let mut folders: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
