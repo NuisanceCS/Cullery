@@ -1,0 +1,51 @@
+# Pushing a tag like v1.0.0 builds Cullery for Windows and Mac and publishes both as a
+# GitHub release. Nothing is published unless both builds work.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --release
+      - run: cargo build --release
+      - run: Copy-Item target/release/cullery.exe Cullery-Windows.exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: Cullery-Windows.exe
+          if-no-files-found: error
+
+  mac:
+    # Apple Silicon.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash tools/make-mac-app.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac
+          path: target/mac-app/Cullery-Mac.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Cullery ${GITHUB_REF_NAME#v}" --notes-file .github/release-notes.md
