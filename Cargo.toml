@@ -1,6 +1,6 @@
 [package]
 name = "cullery"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Fast, simple photo culler for RAW+JPEG shoots"
 
@@ -12,6 +12,8 @@ kamadak-exif = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp", "tiff", "bmp"] }
 trash = "5"
 raw-window-handle = "0.6"
+# Asks GitHub for the latest version when the app opens, using the system's own TLS.
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 # Dragging photos out of the window into other apps uses the Windows shell.
 [target.'cfg(windows)'.dependencies]

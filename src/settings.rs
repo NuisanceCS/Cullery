@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::keybinds::Keybinds;
 use crate::library::SortBy;
 use crate::theme::ThemeId;
 
@@ -49,6 +50,7 @@ pub struct Settings {
     pub export_files: DragFiles,
     pub sort_by: SortBy,
     pub sort_descending: bool,
+    pub keybinds: Keybinds,
     /// The values as last loaded or saved by this window, to tell which ones it changed.
     saved: Snapshot,
 }
@@ -66,6 +68,7 @@ struct Snapshot {
     export_files: DragFiles,
     sort_by: SortBy,
     sort_descending: bool,
+    keybinds: Keybinds,
 }
 
 /// Which of a shot's files to use, when dragging photos out or copying them to the
@@ -138,6 +141,7 @@ impl Default for Settings {
             export_files: DragFiles::Both,
             sort_by: SortBy::Name,
             sort_descending: false,
+            keybinds: Keybinds::default(),
         };
         Self::from_snapshot(saved)
     }
@@ -160,6 +164,7 @@ impl Settings {
             export_files: s.export_files,
             sort_by: s.sort_by,
             sort_descending: s.sort_descending,
+            keybinds: s.keybinds.clone(),
             saved: s,
         }
     }
@@ -176,6 +181,7 @@ impl Settings {
             export_files: self.export_files,
             sort_by: self.sort_by,
             sort_descending: self.sort_descending,
+            keybinds: self.keybinds.clone(),
         }
     }
 
@@ -222,7 +228,11 @@ impl Settings {
                         s.tile_width = v.clamp(120.0, 360.0);
                     }
                 }
-                _ => {}
+                _ => {
+                    if let Some(action) = key.strip_prefix("key_") {
+                        s.keybinds.load(action, value);
+                    }
+                }
             }
         }
         s.recent.truncate(MAX_RECENT);
@@ -231,6 +241,10 @@ impl Settings {
     }
 
     pub fn save(&mut self) {
+        // Tests drive the real app code and mustn't change the real settings.
+        if cfg!(test) {
+            return;
+        }
         if let Some(path) = file() {
             self.save_to(&path);
         }
@@ -274,6 +288,9 @@ impl Settings {
         if mine.sort_descending != base.sort_descending {
             merged.sort_descending = mine.sort_descending;
         }
+        if mine.keybinds != base.keybinds {
+            merged.keybinds = mine.keybinds.clone();
+        }
 
         let mut text = String::new();
         if let Some(dir) = &merged.export_dir {
@@ -290,6 +307,9 @@ impl Settings {
         text += &format!("export_files={}\n", merged.export_files.key());
         text += &format!("sort_by={}\n", merged.sort_by.key());
         text += &format!("sort_desc={}\n", if merged.sort_descending { 1 } else { 0 });
+        for (action, keys) in merged.keybinds.changed() {
+            text += &format!("key_{action}={keys}\n");
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -350,6 +370,7 @@ mod tests {
         s.export_files = DragFiles::Raw;
         s.sort_by = SortBy::Size;
         s.sort_descending = true;
+        s.keybinds.load("pick", "shift+X");
         s.save_to(&path);
         let back = Settings::load_from(&path);
         std::fs::remove_file(&path).unwrap();

@@ -11,16 +11,18 @@ use eframe::egui::{
     ViewportCommand,
 };
 
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::devices::{self, CardFolder};
 use crate::export::{self, Done, Exporter};
+use crate::keybinds::{self, Action as KeyAction};
 use crate::library::{self, Shot, SortBy};
 use crate::loader::{Key, Kind, Loader, Request, THUMB_PX};
 use crate::picks;
 use crate::platform;
 use crate::settings::{DragFiles, Settings};
 use crate::theme::{self, Palette, ThemeId};
+use crate::update;
 
 /// Grid thumbnails kept in memory; the least recently seen are dropped beyond this.
 const MAX_THUMBS: usize = 700;
@@ -57,32 +59,38 @@ enum ExportAction {
     ChooseFolder,
 }
 
-/// Shortcuts shown on the Keybinds page: (keys, what they do).
-const GRID_KEYS: &[(&str, &str)] = &[
+/// The mouse controls listed on the Keybinds page: (what you do, what it does).
+const MOUSE_CONTROLS: &[(&str, &str)] = &[
     ("Click", "Select a photo"),
     ("Ctrl + Click", "Add or remove from the selection"),
     ("Shift + Click", "Select everything from the last clicked photo"),
-    ("Ctrl + A", "Select all"),
-    ("Double-click  /  Enter", "Open the photo"),
-    ("P  /  Space", "Pick the selected photos (again to unpick)"),
-    ("Drag a photo", "Drag it (or the whole selection) into another app or folder"),
-    ("Ctrl + E", "Quick Export the selected photos"),
-    ("Delete", "Delete the selected photos (asks first)"),
-    ("Esc", "Clear the selection, or cancel Select Range"),
-    ("Ctrl + O", "Open a folder"),
-    ("Ctrl + ,", "Open or close Settings"),
+    ("Double-click", "Open the photo"),
+    ("Drag a photo", "Drag it (or the selection) into another app or folder"),
+    ("Scroll wheel", "In the viewer: zoom around the cursor"),
+    ("Double-click", "In the viewer: zoom to that spot, or back to fit"),
+    ("Drag", "In the viewer: move around while zoomed"),
+    ("Mouse back button", "Back to the grid"),
 ];
-const VIEWER_KEYS: &[(&str, &str)] = &[
-    ("←  /  →", "Previous / next photo"),
-    ("Home  /  End", "First / last photo"),
-    ("P  /  Space", "Pick (again to unpick)"),
-    ("Ctrl + E", "Quick Export this photo"),
-    ("Delete", "Delete this photo (asks first)"),
-    ("Scroll wheel", "Zoom around the cursor"),
-    ("Double-click", "Zoom to that spot, or back to fit"),
-    ("Drag", "Move around while zoomed"),
-    ("Esc  /  Mouse back button", "Back to the grid"),
-];
+
+/// What the user did on the Keybinds page.
+enum KeybindChange {
+    None,
+    /// Clicked an action's shortcut: start or stop waiting for its new key.
+    Toggle(keybinds::Action),
+    Restore,
+}
+
+/// A search through a whole drive, running in the background.
+struct DriveScan {
+    dir: PathBuf,
+    result: std::sync::mpsc::Receiver<std::io::Result<Vec<Shot>>>,
+    checked: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    /// A photo to open in the viewer afterwards.
+    show: Option<PathBuf>,
+    /// Updating the drive already open (after a delete), rather than opening it.
+    refresh: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum RangeMode {
@@ -247,6 +255,17 @@ pub struct App {
     /// A macOS drag just ended. It kept the mouse-up, so the window still thinks the
     /// button is held until it's told otherwise.
     release_pointer: bool,
+    /// A newer version, once the check at startup has found one.
+    new_version: Arc<Mutex<Option<String>>>,
+    /// The popup offering the update is open.
+    update_prompt: bool,
+    /// The Keybinds page is waiting for this action's new key.
+    rebinding: Option<KeyAction>,
+    /// A whole drive being searched for photos.
+    drive_scan: Option<DriveScan>,
+    /// Remembered picks that aren't photos in the open folder right now, like another
+    /// memory card's. Kept so saving this folder's picks doesn't lose them.
+    other_picks: Vec<picks::Pick>,
     /// Some photo in this folder has a RAW partner (else Show Paired RAW is hidden).
     has_raw_pairs: bool,
     /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
@@ -281,6 +300,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, start: crate::args::StartArgs) -> Self {
         let mut app = Self::with_context(&cc.egui_ctx);
+        app.new_version = update::check(cc.egui_ctx.clone());
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         app.hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
@@ -310,6 +330,10 @@ impl App {
         } else if !path.is_file() {
             self.error(format!("Couldn't find {}", path.display()));
         } else if let Some(folder) = path.parent().map(Path::to_path_buf) {
+            if library::is_drive_root(&folder) {
+                self.start_drive_scan(folder, Some(path), false);
+                return;
+            }
             self.open_folder(ctx, folder);
             if self.folder.is_some() {
                 self.show_file(&path);
@@ -392,6 +416,11 @@ impl App {
             view_picked: false,
             hwnd: None,
             release_pointer: false,
+            new_version: Arc::default(),
+            update_prompt: false,
+            rebinding: None,
+            drive_scan: None,
+            other_picks: Vec::new(),
             has_raw_pairs: false,
             last_drag: HashSet::new(),
             pending_drag: None,
@@ -424,8 +453,88 @@ impl App {
         }
     }
 
+    /// Opens a folder. A whole drive is searched in the background, subfolders included.
     fn open_folder(&mut self, ctx: &egui::Context, dir: PathBuf) {
-        match library::scan(&dir) {
+        if library::is_drive_root(&dir) {
+            self.start_drive_scan(dir, None, false);
+        } else {
+            let result = library::scan(&dir);
+            self.finish_open(ctx, dir, result);
+        }
+    }
+
+    /// Starts searching a whole drive; `poll_drive_scan` takes over when it's done.
+    fn start_drive_scan(&mut self, dir: PathBuf, show: Option<PathBuf>, refresh: bool) {
+        let (send, result) = std::sync::mpsc::channel();
+        let checked = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let skip = self.settings.export_dir.clone();
+        let (folder, seen, stopping) = (dir.clone(), checked.clone(), stop.clone());
+        let started = std::thread::Builder::new().name("drive-scan".into()).spawn(move || {
+            let _ = send.send(library::scan_with_subfolders(&folder, skip.as_deref(), &seen, &stopping));
+        });
+        match started {
+            Ok(_) => self.drive_scan = Some(DriveScan { dir, result, checked, stop, show, refresh }),
+            Err(e) => self.error(format!("Couldn't search {}: {e}", dir.display())),
+        }
+    }
+
+    fn poll_drive_scan(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &self.drive_scan else { return };
+        let result = match scan.result.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::io::Error::other("the search stopped unexpectedly")),
+        };
+        let Some(scan) = self.drive_scan.take() else { return };
+        if scan.refresh {
+            if let Ok(mut shots) = result {
+                library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
+                self.adopt_shots(shots);
+            }
+            return;
+        }
+        self.finish_open(ctx, scan.dir, result);
+        if let (Some(path), true) = (scan.show, self.folder.is_some()) {
+            self.show_file(&path);
+        }
+    }
+
+    /// The popup while a drive is searched, which can take a while on a big one.
+    fn drive_scan_dialog(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &self.drive_scan else { return };
+        let p = self.p;
+        let checked = scan.checked.load(AtomicOrdering::Relaxed);
+        let can_cancel = !scan.refresh;
+        let name = scan.dir.display().to_string();
+        let mut cancelled = false;
+        let modal = egui::Modal::new(Id::new("drive-scan"))
+            .frame(Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                    ui.label(RichText::new(format!("Looking for photos on {name}")).font(theme::font_semibold(17.0)));
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("Checked {checked} {} so far, including subfolders.", plural(checked, "file", "files"))).color(p.label2));
+                if can_cancel {
+                    ui.add_space(16.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        cancelled = ui.add(Button::new("Cancel").corner_radius(p.r_ctl).min_size(vec2(96.0, 32.0))).clicked();
+                    });
+                }
+            });
+        if can_cancel && (cancelled || modal.should_close()) {
+            scan.stop.store(true, AtomicOrdering::Relaxed);
+            self.drive_scan = None;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// Shows the photos a search of `dir` found.
+    fn finish_open(&mut self, ctx: &egui::Context, dir: PathBuf, result: std::io::Result<Vec<Shot>>) {
+        match result {
             Ok(mut shots) => {
                 library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
                 self.generation = self.loader.reset();
@@ -495,20 +604,27 @@ impl App {
         self.settings.export_dir.clone()
     }
 
-    /// Picks are remembered per folder, so they survive closing the app.
+    /// Picks are remembered per folder, so they survive closing the app. A photo only
+    /// counts as picked if it's the same size as the one picked: another memory card
+    /// can have the same folder and file names.
     fn reload_picks(&mut self) {
         self.picked.clear();
-        let Some(names) = self.folder.as_deref().and_then(picks::load) else { return };
+        self.other_picks.clear();
+        let Some(mut saved) = self.folder.as_deref().and_then(picks::load) else { return };
         for (i, shot) in self.shots.iter().enumerate() {
-            if names.contains(&shot.key) {
+            let exact = saved.remove(&(shot.key.clone(), Some(shot.size)));
+            let from_older_version = saved.remove(&(shot.key.clone(), None));
+            if exact || from_older_version {
                 self.picked.insert(i);
             }
         }
+        self.other_picks = saved.into_iter().collect();
     }
 
     fn save_picks(&self) {
         let Some(folder) = &self.folder else { return };
-        picks::save(folder, self.picked.iter().map(|&i| self.shots[i].key.as_str()));
+        let current = self.picked.iter().map(|&i| (self.shots[i].key.clone(), Some(self.shots[i].size)));
+        picks::save(folder, current.chain(self.other_picks.iter().cloned()));
     }
 
     fn toggle_pick(&mut self, shot: usize) {
@@ -821,7 +937,7 @@ impl App {
                         }
                     } else {
                         let label = if self.folder.is_some() { "🗁" } else { "🗁  Open Folder" };
-                        if ui.add(Button::new(label)).on_hover_text(platform::keys("Open folder (Ctrl+O)")).clicked() {
+                        if ui.add(Button::new(label)).on_hover_text(format!("Open folder ({})", self.settings.keybinds.main_text(KeyAction::OpenFolder))).clicked() {
                             self.choose_folder(ctx);
                         }
                         self.recent_menu(ui, ctx);
@@ -850,6 +966,12 @@ impl App {
                         let open = self.settings_page.is_some();
                         if cog_button(ui, &p, open).on_hover_text("Settings").clicked() {
                             self.settings_page = if open { None } else { Some(SettingsPage::DragDrop) };
+                        }
+                        let new_version = self.new_version.lock().unwrap().clone();
+                        if let Some(version) = new_version {
+                            if update_button(ui, &p).on_hover_text(format!("Update available: version {version}")).clicked() {
+                                self.update_prompt = true;
+                            }
                         }
                     });
                 });
@@ -994,7 +1116,7 @@ impl App {
         let p = self.p;
         let mut job = LayoutJob::default();
         job.append("Quick Export", 0.0, TextFormat { font_id: theme::font(13.5), color: p.label, ..Default::default() });
-        job.append(&platform::keys("   Ctrl E"), 0.0, key_hint(12.0, p.label2));
+        job.append(&format!("   {}", self.settings.keybinds.hint(KeyAction::QuickExport)), 0.0, key_hint(12.0, p.label2));
         let tip = format!("Copy {} to the export folder", self.settings.export_files.label());
         if ui.add_enabled(enabled, Button::new(job)).on_hover_text(tip).clicked() {
             self.quick_export();
@@ -1175,7 +1297,7 @@ impl App {
     /// out of Cullery that land back on it are ignored.
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        if dropped.is_empty() || self.deleting.is_some() {
+        if dropped.is_empty() || self.deleting.is_some() || self.drive_scan.is_some() {
             return;
         }
         if dropped.iter().all(|p| self.last_drag.contains(p)) {
@@ -1283,6 +1405,70 @@ impl App {
         }
     }
 
+    /// While the Keybinds page waits for a new key: the next key pressed becomes the
+    /// shortcut (Esc cancels), and no key reaches anything else. Returns whether it's
+    /// waiting.
+    fn capture_keybind(&mut self, ctx: &egui::Context) -> bool {
+        if self.settings_page != Some(SettingsPage::Keybinds) {
+            self.rebinding = None;
+        }
+        let Some(action) = self.rebinding else { return false };
+        let press = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        });
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Key { .. })));
+        if let Some((key, modifiers)) = press {
+            self.rebinding = None;
+            if key != KeyCode::Escape {
+                self.settings.keybinds.assign(action, keybinds::Shortcut::from_press(key, modifiers));
+                self.settings.save();
+            }
+        }
+        true
+    }
+
+    /// The popup from the "!" button: says there's an update and offers its download page.
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        if !self.update_prompt {
+            return;
+        }
+        let Some(version) = self.new_version.lock().unwrap().clone() else {
+            self.update_prompt = false;
+            return;
+        };
+        let p = self.p;
+        let (mut yes, mut no) = (false, false);
+        let modal = egui::Modal::new(Id::new("update-available"))
+            .frame(Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new("Update available").font(theme::font_semibold(17.0)));
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("Cullery {version} is out. You have version {}.", update::CURRENT_VERSION)).color(p.label));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Open the download page on GitHub?").color(p.label2));
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let open = Button::new(RichText::new("Yes").color(p.on_accent).font(theme::font_semibold(13.5)))
+                        .fill(p.accent)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(p.r_ctl)
+                        .min_size(vec2(96.0, 32.0));
+                    yes = ui.add(open).clicked();
+                    no = ui.add(Button::new("No").corner_radius(p.r_ctl).min_size(vec2(96.0, 32.0))).clicked();
+                });
+            });
+        if yes {
+            crate::window::open_link(update::DOWNLOAD_PAGE);
+        }
+        if yes || no || modal.should_close() {
+            self.update_prompt = false;
+        }
+    }
+
     /// Starts deleting these shots' files in the background. `finish_delete` takes over
     /// when they're gone.
     fn delete_shots(&mut self, ctx: &egui::Context, shots: &[usize], permanent: bool) {
@@ -1358,6 +1544,10 @@ impl App {
     /// selection, the viewed photo and the range (all matched up by shot name).
     fn refresh_folder(&mut self) {
         let Some(dir) = self.folder.clone() else { return };
+        if library::is_drive_root(&dir) {
+            self.start_drive_scan(dir, None, true);
+            return;
+        }
         let Ok(mut new_shots) = library::scan(&dir) else { return };
         library::sort(&mut new_shots, self.settings.sort_by, self.settings.sort_descending);
         self.adopt_shots(new_shots);
@@ -1511,7 +1701,7 @@ impl App {
                 ui.label(RichText::new("No Folder Open").font(theme::font_semibold(22.0)));
                 ui.label(RichText::new("Drop a folder or SD card here, or open one to start culling.").color(p.label2).size(14.0));
                 ui.add_space(8.0);
-                let open_btn = Button::new(RichText::new(platform::keys("Open Folder…    Ctrl O")).color(p.on_accent).font(theme::font_semibold(14.0)))
+                let open_btn = Button::new(RichText::new(format!("Open Folder…    {}", self.settings.keybinds.hint(KeyAction::OpenFolder))).color(p.on_accent).font(theme::font_semibold(14.0)))
                     .fill(p.accent)
                     .stroke(Stroke::NONE)
                     .corner_radius(p.r_pill)
@@ -1522,11 +1712,11 @@ impl App {
 
                 if !cards.is_empty() {
                     ui.add_space(24.0);
-                    section_label(ui, &p, if cfg!(target_os = "macos") { "Drives" } else { "Memory Cards" });
+                    section_label(ui, &p, "Drives");
                     for card in &cards {
                         let heics = if card.heics > 0 { format!("{} HEIC · ", card.heics) } else { String::new() };
                         let sub = if card.jpgs + card.heics + card.raws == 0 {
-                            "External drive".to_string()
+                            "All photos, including subfolders".to_string()
                         } else {
                             format!("{} JPG · {heics}{} RAW", card.jpgs, card.raws)
                         };
@@ -2156,25 +2346,26 @@ impl App {
             home: bool,
             end: bool,
         }
+        let capturing = self.capture_keybind(ctx);
+        let binds = &self.settings.keybinds;
         let mut k = ctx.input(|i| Keys {
-            open: i.modifiers.command && i.key_pressed(KeyCode::O),
-            export: i.modifiers.command && i.key_pressed(KeyCode::E),
-            select_all: i.modifiers.command && i.key_pressed(KeyCode::A),
-            esc: i.key_pressed(KeyCode::Escape),
-            enter: i.key_pressed(KeyCode::Enter),
-            left: i.key_pressed(KeyCode::ArrowLeft),
-            right: i.key_pressed(KeyCode::ArrowRight),
-            pick: !i.modifiers.command && (i.key_pressed(KeyCode::P) || i.key_pressed(KeyCode::Space)),
-            home: i.key_pressed(KeyCode::Home),
-            end: i.key_pressed(KeyCode::End),
+            open: binds.pressed(KeyAction::OpenFolder, i),
+            export: binds.pressed(KeyAction::QuickExport, i),
+            select_all: binds.pressed(KeyAction::SelectAll, i),
+            esc: binds.pressed(KeyAction::Back, i),
+            enter: binds.pressed(KeyAction::OpenPhoto, i),
+            left: binds.pressed(KeyAction::Previous, i),
+            right: binds.pressed(KeyAction::Next, i),
+            pick: binds.pressed(KeyAction::Pick, i),
+            home: binds.pressed(KeyAction::First, i),
+            end: binds.pressed(KeyAction::Last, i),
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
-            // The key marked "delete" on a Mac keyboard is the one egui calls Backspace.
-            delete: i.key_pressed(KeyCode::Delete) || (cfg!(target_os = "macos") && i.key_pressed(KeyCode::Backspace)),
-            settings: i.modifiers.command && i.key_pressed(KeyCode::Comma),
+            delete: binds.pressed(KeyAction::Delete, i),
+            settings: binds.pressed(KeyAction::Settings, i),
         });
         // While the delete confirmation is up, it gets the keys (Esc cancels it); while
         // a delete runs, nothing should touch the photos.
-        if self.confirm_delete.is_some() || self.deleting.is_some() {
+        if self.confirm_delete.is_some() || self.deleting.is_some() || self.update_prompt || self.drive_scan.is_some() || capturing {
             k = Keys::default();
         }
         // Ctrl + , opens or closes Settings, as in many Windows apps.
@@ -2273,6 +2464,9 @@ impl App {
         self.settings_window(ctx);
         self.delete_dialog(ctx);
         self.delete_progress(ctx);
+        self.update_dialog(ctx);
+        self.poll_drive_scan(ctx);
+        self.drive_scan_dialog(ctx);
         self.draw_toast(ctx);
         self.draw_drop_overlay(ctx);
         self.draw_drag_out_overlay(ctx);
@@ -2302,6 +2496,7 @@ impl App {
         let mut open = true;
         let mut chosen_theme = None;
         let mut export_action = ExportAction::None;
+        let mut keybind_change = KeybindChange::None;
         // Every page gets the same fixed area (long pages scroll inside it), so the
         // window keeps one size when switching pages.
         const SIDEBAR_W: f32 = 140.0;
@@ -2343,7 +2538,7 @@ impl App {
                         ui.set_min_size(PAGE);
                         ui.set_max_size(PAGE);
                         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match page {
-                            SettingsPage::Keybinds => keybinds_page(ui, &p),
+                            SettingsPage::Keybinds => keybind_change = keybinds_page(ui, &p, &self.settings.keybinds, self.rebinding),
                             SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
                             SettingsPage::ExportOnPick => export_action = export_page(ui, &p, &mut self.settings),
                             SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.theme_shown),
@@ -2353,6 +2548,17 @@ impl App {
             });
         if let Some(theme) = chosen_theme {
             self.set_theme(ctx, theme);
+        }
+        match keybind_change {
+            KeybindChange::None => {}
+            KeybindChange::Toggle(action) => {
+                self.rebinding = if self.rebinding == Some(action) { None } else { Some(action) };
+            }
+            KeybindChange::Restore => {
+                self.rebinding = None;
+                self.settings.keybinds = keybinds::Keybinds::default();
+                self.settings.save();
+            }
         }
         match export_action {
             ExportAction::None => {}
@@ -2377,19 +2583,45 @@ impl App {
     }
 }
 
-fn keybinds_page(ui: &mut Ui, p: &Palette) {
-    for (title, keys) in [("Grid", GRID_KEYS), ("Viewer", VIEWER_KEYS)] {
-        ui.label(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label2));
-        egui::Grid::new(title).num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
-            for (key, action) in keys {
-                ui.label(RichText::new(platform::keys(key)).font(theme::font_semibold(13.0)));
-                ui.label(RichText::new(*action).color(p.label2));
-                ui.end_row();
+fn keybinds_page(ui: &mut Ui, p: &Palette, binds: &keybinds::Keybinds, rebinding: Option<KeyAction>) -> KeybindChange {
+    let mut change = KeybindChange::None;
+    ui.label(RichText::new("Keyboard").font(theme::font_semibold(13.5)).color(p.label2));
+    ui.label(RichText::new("Click a shortcut, then press its new key. Esc cancels.").color(p.label2));
+    ui.add_space(6.0);
+    egui::Grid::new("keyboard").num_columns(2).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
+        for action in KeyAction::ALL {
+            ui.label(action.label());
+            let waiting = rebinding == Some(action);
+            let text = if waiting {
+                RichText::new("Press a key…").color(p.on_accent)
+            } else {
+                RichText::new(binds.text(action)).font(theme::font_semibold(13.0))
+            };
+            let mut button = Button::new(text).corner_radius(p.r_ctl).min_size(vec2(150.0, 28.0));
+            if waiting {
+                button = button.fill(p.accent).stroke(Stroke::NONE);
             }
-        });
-        ui.add_space(12.0);
+            if ui.add(button).clicked() {
+                change = KeybindChange::Toggle(action);
+            }
+            ui.end_row();
+        }
+    });
+    ui.add_space(14.0);
+    ui.label(RichText::new("Mouse").font(theme::font_semibold(13.5)).color(p.label2));
+    ui.add_space(4.0);
+    egui::Grid::new("mouse").num_columns(2).spacing(vec2(18.0, 7.0)).show(ui, |ui| {
+        for (control, action) in MOUSE_CONTROLS {
+            ui.label(RichText::new(platform::keys(control)).font(theme::font_semibold(13.0)));
+            ui.label(RichText::new(*action).color(p.label2));
+            ui.end_row();
+        }
+    });
+    ui.add_space(16.0);
+    if ui.add(Button::new("Restore Defaults").corner_radius(p.r_ctl).min_size(vec2(150.0, 32.0))).clicked() {
+        change = KeybindChange::Restore;
     }
-    ui.label(RichText::new("Changing keybinds is coming soon.").color(p.label2).italics());
+    change
 }
 
 fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
@@ -2862,6 +3094,24 @@ fn scrollbar(ui: &Ui, p: &Palette, rect: Rect, offset: f32, content_h: f32, view
     ((new - offset).abs() > 0.01).then_some(new)
 }
 
+/// A small "!" in a filled circle, shown beside Settings when there's an update.
+fn update_button(ui: &mut Ui, p: &Palette) -> Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(30.0, 32.0), Sense::hover());
+    let resp = ui.interact(rect, Id::new("update-button"), Sense::click());
+    let painter = ui.painter();
+    if resp.hovered() {
+        painter.rect_filled(rect, p.r_ctl, p.hover);
+    }
+    let c = rect.center();
+    painter.circle_filled(c, 9.0, p.accent);
+    // Drawn rather than typed: a font's "!" doesn't sit in the middle of its line. The
+    // bar and dot together span 5 points either side of the center.
+    let bar = Rect::from_min_max(c + vec2(-1.15, -5.0), c + vec2(1.15, 1.0));
+    painter.rect_filled(bar, 1.15, p.on_accent);
+    painter.circle_filled(c + vec2(0.0, 3.7), 1.3, p.on_accent);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// Round icon button with a gear drawn in it, for Settings.
 fn cog_button(ui: &mut Ui, p: &Palette, open: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(36.0, 32.0), Sense::click());
@@ -3246,6 +3496,125 @@ mod tests {
         h.app.back_to_grid();
         assert!(h.app.selected.is_empty());
         h.frame(vec![], 0.016);
+    }
+
+    /// A different card at the same location, with the same file names, doesn't inherit
+    /// the first card's picks, and they're still there when that card comes back.
+    #[test]
+    fn picks_stay_with_their_card() {
+        let (mut h, dir) = harness_with_files("picks-card");
+        h.app.settings.export_on_pick = false;
+        h.app.reload_picks();
+        h.app.selected = [1].into_iter().collect();
+        h.app.pick_selected();
+        assert_eq!(h.app.picked, [1].into_iter().collect());
+
+        // "Another card": every photo has a different size.
+        let card_a = std::mem::take(&mut h.app.shots);
+        h.app.shots = card_a.iter().cloned().map(|s| Shot { size: s.size + 100, ..s }).collect();
+        h.app.reload_picks();
+        assert!(h.app.picked.is_empty(), "nothing is picked on the other card");
+        h.app.selected = [2].into_iter().collect();
+        h.app.pick_selected();
+
+        h.app.shots = card_a;
+        h.app.reload_picks();
+        assert_eq!(h.app.picked, [1].into_iter().collect(), "the first card's pick came back");
+        cleanup(&dir);
+    }
+
+    /// Saved picks from before sizes were recorded still count.
+    #[test]
+    fn picks_from_older_versions_still_load() {
+        let (mut h, dir) = harness_with_files("picks-old");
+        picks::save(&dir, [("img_0002".to_string(), None)].into_iter());
+        h.app.reload_picks();
+        assert_eq!(h.app.picked, [2].into_iter().collect());
+        cleanup(&dir);
+    }
+
+    /// Clicking a shortcut waits for a key, and that key then does the job. Esc cancels,
+    /// and Restore Defaults' reset puts the old key back.
+    #[test]
+    fn a_rebound_key_takes_over() {
+        let mut h = Harness::new();
+        let key = |k: KeyCode| Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        h.app.settings.export_on_pick = false;
+        h.app.settings.keybinds = keybinds::Keybinds::default();
+        h.app.selected = [3].into_iter().collect();
+        h.app.settings_page = Some(SettingsPage::Keybinds);
+        h.frame(vec![], 0.016);
+
+        h.app.rebinding = Some(KeyAction::Pick);
+        h.frame(vec![key(KeyCode::Escape)], 0.016);
+        assert!(h.app.rebinding.is_none());
+        assert!(h.app.settings_page == Some(SettingsPage::Keybinds), "Esc only cancelled the wait");
+        assert_eq!(h.app.settings.keybinds, keybinds::Keybinds::default());
+
+        h.app.rebinding = Some(KeyAction::Pick);
+        h.frame(vec![key(KeyCode::X)], 0.016);
+        assert!(h.app.rebinding.is_none());
+        h.app.settings_page = None;
+        h.frame(vec![], 0.016);
+
+        h.frame(vec![key(KeyCode::P)], 0.016);
+        assert!(h.app.picked.is_empty(), "the old key does nothing now");
+        h.frame(vec![key(KeyCode::X)], 0.016);
+        assert_eq!(h.app.picked, [3].into_iter().collect());
+    }
+
+    /// Opening a drive searches in the background and ends up with the photos in its
+    /// subfolders.
+    #[test]
+    fn a_drive_search_opens_its_subfolders() {
+        let mut h = Harness::new();
+        let dir = std::env::temp_dir().join(format!("cullery-drive-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("100CANON")).unwrap();
+        std::fs::write(dir.join("100CANON").join("IMG_1.JPG"), b"x").unwrap();
+        std::fs::write(dir.join("top.png"), b"x").unwrap();
+
+        h.app.start_drive_scan(dir.clone(), None, false);
+        for _ in 0..500 {
+            h.frame(vec![], 0.016);
+            if h.app.drive_scan.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(h.app.drive_scan.is_none(), "the search finished");
+        assert_eq!(h.app.folder.as_deref(), Some(dir.as_path()));
+        assert_eq!(h.app.shots.len(), 2);
+        if let Some(f) = picks::file_for(&dir) {
+            let _ = std::fs::remove_file(f);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The "!" only shows with an update waiting. Clicking it opens the popup; closing
+    /// the popup leaves the "!" there.
+    #[test]
+    fn update_button_opens_the_popup() {
+        let mut h = Harness::new();
+        let button = Id::new("update-button");
+        assert!(h.ctx.read_response(button).is_none());
+
+        *h.app.new_version.lock().unwrap() = Some("1.2.0".into());
+        h.frame(vec![], 0.016);
+        h.frame(vec![], 0.016);
+        let pos = h.ctx.read_response(button).expect("the button is drawn").rect.center();
+        assert!(!h.app.update_prompt, "the popup waits for a click");
+        h.frame(vec![Event::PointerMoved(pos)], 0.016);
+        h.frame(vec![Harness::button(pos, true)], 0.06);
+        h.frame(vec![Harness::button(pos, false)], 0.016);
+        h.frame(vec![], 0.016);
+        assert!(h.app.update_prompt);
+
+        let esc = Event::Key { key: KeyCode::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        h.frame(vec![esc], 0.016);
+        h.frame(vec![], 0.016);
+        assert!(!h.app.update_prompt);
+        assert!(h.ctx.read_response(button).is_some());
     }
 
     /// Opening another folder drops everything that referred to the last one,
@@ -3662,7 +4031,8 @@ mod tests {
         h.app.pick_selected();
         assert_eq!(h.app.picked, [1, 3].into_iter().collect());
         assert_eq!(h.app.exporter.pending(), 0, "nothing copied");
-        assert_eq!(picks::load(&dir).unwrap(), ["img_0001", "img_0003"].map(String::from).into_iter().collect());
+        let saved: HashSet<String> = picks::load(&dir).unwrap().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(saved, ["img_0001", "img_0003"].map(String::from).into_iter().collect());
         h.app.pick_selected();
         assert!(h.app.picked.is_empty(), "picking again unpicks");
         cleanup(&dir);

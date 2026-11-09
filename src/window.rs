@@ -89,7 +89,12 @@ pub fn open_link(url: &str) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn open_link(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn open_link(_url: &str) {}
 
 #[cfg(not(windows))]

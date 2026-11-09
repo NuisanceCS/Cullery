@@ -45,17 +45,17 @@ pub fn watch(ctx: eframe::egui::Context) -> Arc<Mutex<Vec<CardFolder>>> {
     found
 }
 
-/// Where a memory card's DCIM folder could be.
-#[cfg(not(target_os = "macos"))]
-fn dcim_candidates() -> Vec<PathBuf> {
-    // A: and B: are floppy letters; C: is the system drive.
-    (b'D'..=b'Z').map(|letter| PathBuf::from(format!("{}:\\DCIM", letter as char))).collect()
-}
-
-/// Where a memory card's DCIM folder could be.
-#[cfg(target_os = "macos")]
+/// Where a memory card's DCIM folder could be. Every camera uses that name: it's part
+/// of the standard for memory card layouts.
 fn dcim_candidates() -> Vec<PathBuf> {
     volumes().into_iter().map(|v| v.join("DCIM")).collect()
+}
+
+/// The drives plugged in.
+#[cfg(not(target_os = "macos"))]
+fn volumes() -> Vec<PathBuf> {
+    // A: and B: are floppy letters; C: is the system drive.
+    (b'D'..=b'Z').map(|letter| PathBuf::from(format!("{}:\\", letter as char))).filter(|p| p.exists()).collect()
 }
 
 /// The drives plugged in. The startup disk is in /Volumes too, as a link to `/`.
@@ -73,7 +73,6 @@ fn volumes() -> Vec<PathBuf> {
 }
 
 /// Lists the drives that aren't already shown through a DCIM folder of photos.
-#[cfg(target_os = "macos")]
 fn add_other_drives(found: &mut Vec<CardFolder>) {
     for path in volumes() {
         if !found.iter().any(|card| card.path.starts_with(&path)) {
@@ -81,9 +80,6 @@ fn add_other_drives(found: &mut Vec<CardFolder>) {
         }
     }
 }
-
-#[cfg(not(target_os = "macos"))]
-fn add_other_drives(_found: &mut Vec<CardFolder>) {}
 
 fn scan() -> Vec<CardFolder> {
     let mut found = Vec::new();

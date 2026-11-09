@@ -1,7 +1,7 @@
 //! Decoding through Windows Imaging Component (WIC) — the system decoders the Photos
 //! app uses. Cullery uses it for HEIC/HEIF, which needs Microsoft's free "HEIF Image
 //! Extensions" (and "HEVC Video Extensions") from the Store; without them, decoding
-//! fails and the photo shows "No preview".
+//! fails and the photo shows "No preview". On macOS the same job goes to Apple's ImageIO.
 
 use std::path::Path;
 
@@ -115,9 +115,162 @@ fn has_heif_reader(factory: &windows::Win32::Graphics::Imaging::IWICImagingFacto
     unsafe { factory.CreateDecoder(&GUID_ContainerFormatHeif, std::ptr::null()).is_ok() }
 }
 
-#[cfg(not(windows))]
+/// Decodes `path` with Apple's ImageIO, scaled down to fit within `max` before rotation.
+#[cfg(target_os = "macos")]
+pub fn decode(path: &Path, max: [u32; 2]) -> Result<Decoded, String> {
+    mac::decode(path, max)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn decode(_path: &Path, _max: [u32; 2]) -> Result<Decoded, String> {
-    Err("HEIC needs Windows' image decoders".into())
+    Err("HEIC photos can't be opened on this system".into())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(non_upper_case_globals, non_snake_case)]
+mod mac {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::null;
+
+    use super::Decoded;
+
+    type CFTypeRef = *const c_void;
+
+    #[repr(C)]
+    struct CGRect {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    }
+
+    const K_CF_NUMBER_SINT32: isize = 3;
+    const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFAllocatorDefault: CFTypeRef;
+        static kCFBooleanTrue: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: u8;
+        static kCFTypeDictionaryValueCallBacks: u8;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFURLCreateFromFileSystemRepresentation(allocator: CFTypeRef, buffer: *const u8, length: isize, is_directory: u8) -> CFTypeRef;
+        fn CFDictionaryCreate(allocator: CFTypeRef, keys: *const CFTypeRef, values: *const CFTypeRef, count: isize, key_callbacks: *const u8, value_callbacks: *const u8) -> CFTypeRef;
+        fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFNumberCreate(allocator: CFTypeRef, number_type: isize, value: *const c_void) -> CFTypeRef;
+        fn CFNumberGetValue(number: CFTypeRef, number_type: isize, value: *mut c_void) -> u8;
+    }
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        static kCGImagePropertyPixelWidth: CFTypeRef;
+        static kCGImagePropertyPixelHeight: CFTypeRef;
+        static kCGImagePropertyOrientation: CFTypeRef;
+        static kCGImageSourceCreateThumbnailFromImageAlways: CFTypeRef;
+        static kCGImageSourceThumbnailMaxPixelSize: CFTypeRef;
+        fn CGImageSourceCreateWithURL(url: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
+        fn CGImageSourceCopyPropertiesAtIndex(source: CFTypeRef, index: usize, options: CFTypeRef) -> CFTypeRef;
+        fn CGImageSourceCreateThumbnailAtIndex(source: CFTypeRef, index: usize, options: CFTypeRef) -> CFTypeRef;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        static kCGColorSpaceSRGB: CFTypeRef;
+        fn CGColorSpaceCreateWithName(name: CFTypeRef) -> CFTypeRef;
+        fn CGImageGetWidth(image: CFTypeRef) -> usize;
+        fn CGImageGetHeight(image: CFTypeRef) -> usize;
+        fn CGBitmapContextCreate(data: *mut c_void, width: usize, height: usize, bits_per_component: usize, bytes_per_row: usize, space: CFTypeRef, bitmap_info: u32) -> CFTypeRef;
+        fn CGContextDrawImage(context: CFTypeRef, rect: CGRect, image: CFTypeRef);
+    }
+
+    /// A Core Foundation object this code owns, released when dropped.
+    struct Owned(CFTypeRef);
+
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: `owned` only wraps non-null objects from "Create" or "Copy" calls.
+            unsafe { CFRelease(self.0) }
+        }
+    }
+
+    fn owned(object: CFTypeRef) -> Result<Owned, String> {
+        if object.is_null() {
+            Err("macOS couldn't read this image".to_string())
+        } else {
+            Ok(Owned(object))
+        }
+    }
+
+    pub fn decode(path: &Path, max: [u32; 2]) -> Result<Decoded, String> {
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: every object passed along is checked non-null by `owned` and outlives
+        // the call using it; `rgba` is exactly the size the bitmap context is told.
+        unsafe {
+            let url = owned(CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault, bytes.as_ptr(), bytes.len() as isize, 0))?;
+            let source = owned(CGImageSourceCreateWithURL(url.0, null()))?;
+            let properties = owned(CGImageSourceCopyPropertiesAtIndex(source.0, 0, null()))?;
+            let number = |key: CFTypeRef| -> Option<u32> {
+                let value = CFDictionaryGetValue(properties.0, key);
+                let mut out = 0_i32;
+                (!value.is_null() && CFNumberGetValue(value, K_CF_NUMBER_SINT32, &mut out as *mut i32 as *mut c_void) != 0)
+                    .then_some(out as u32)
+            };
+            let too_odd = || "macOS couldn't read this image's size".to_string();
+            let w = number(kCGImagePropertyPixelWidth).filter(|&n| n > 0).ok_or_else(too_odd)?;
+            let h = number(kCGImagePropertyPixelHeight).filter(|&n| n > 0).ok_or_else(too_odd)?;
+            let orientation = number(kCGImagePropertyOrientation).unwrap_or(1);
+
+            // Fit within `max` (in stored orientation) without enlarging.
+            let sideways = (5..=8).contains(&orientation);
+            let [mw, mh] = if sideways { [max[1], max[0]] } else { max };
+            let scale = (mw as f64 / w as f64).min(mh as f64 / h as f64).min(1.0);
+            let long_edge = ((w.max(h) as f64 * scale).round() as i32).max(1);
+
+            // Without the "with transform" option the picture stays in stored orientation.
+            let limit = owned(CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32, &long_edge as *const i32 as *const c_void))?;
+            let keys = [kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceThumbnailMaxPixelSize];
+            let values = [kCFBooleanTrue, limit.0];
+            let options = owned(CFDictionaryCreate(
+                kCFAllocatorDefault,
+                keys.as_ptr(),
+                values.as_ptr(),
+                2,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            ))?;
+            let image = owned(CGImageSourceCreateThumbnailAtIndex(source.0, 0, options.0))?;
+
+            let (width, height) = (CGImageGetWidth(image.0), CGImageGetHeight(image.0));
+            let mut rgba = vec![0_u8; width * height * 4];
+            let space = owned(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))?;
+            let context = owned(CGBitmapContextCreate(
+                rgba.as_mut_ptr() as *mut c_void,
+                width,
+                height,
+                8,
+                width * 4,
+                space.0,
+                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+            ))?;
+            CGContextDrawImage(context.0, CGRect { x: 0.0, y: 0.0, width: width as f64, height: height as f64 }, image.0);
+            drop(context);
+
+            // The bitmap is premultiplied; the rest of the app expects straight alpha.
+            for pixel in rgba.chunks_exact_mut(4) {
+                let alpha = pixel[3] as u32;
+                if alpha != 0 && alpha != 255 {
+                    for channel in &mut pixel[..3] {
+                        *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+                    }
+                }
+            }
+
+            let original = if sideways { [h, w] } else { [w, h] };
+            Ok(Decoded { rgba, size: [width as u32, height as u32], original, orientation })
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

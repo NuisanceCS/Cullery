@@ -7,6 +7,7 @@ mod devices;
 mod dragimage;
 mod dragout;
 mod export;
+mod keybinds;
 mod library;
 mod loader;
 mod picks;
@@ -14,6 +15,7 @@ mod platform;
 mod raw;
 mod settings;
 mod theme;
+mod update;
 mod wic;
 mod window;
 

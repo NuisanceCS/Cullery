@@ -6,8 +6,10 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::SystemTime;
 
 use crate::raw;
@@ -198,17 +200,69 @@ fn extension(path: Option<&Path>) -> Option<String> {
     Some(path?.extension()?.to_str()?.to_ascii_lowercase())
 }
 
+/// Whether `dir` is a whole drive. Opening one takes in the folders inside it too.
+pub fn is_drive_root(dir: &Path) -> bool {
+    if cfg!(target_os = "macos") {
+        dir.parent() == Some(Path::new("/Volumes"))
+    } else {
+        dir.parent().is_none() && dir.has_root()
+    }
+}
+
 /// Lists the shots in `dir` (not its subfolders), sorted alphabetically by name.
 pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
-    let mut files: Vec<(PathBuf, std::fs::Metadata)> = std::fs::read_dir(dir)?
+    let files = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| (e.path(), m)))
         .collect();
+    Ok(pair_up(dir, files))
+}
+
+/// Folders the system keeps for itself on a drive.
+fn is_system_folder(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with('.') || name.starts_with('$') || name.eq_ignore_ascii_case("System Volume Information")
+}
+
+/// Lists the shots in `dir` and every folder inside it, except `skip`. Each file seen
+/// adds to `checked`; setting `stop` ends the search early.
+pub fn scan_with_subfolders(dir: &Path, skip: Option<&Path>, checked: &AtomicUsize, stop: &AtomicBool) -> io::Result<Vec<Shot>> {
+    let mut files = Vec::new();
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        if stop.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(e) if folder == dir => return Err(e),
+            // One unreadable folder shouldn't stop the rest of the drive.
+            Err(_) => continue,
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let Ok(meta) = entry.metadata() else { continue };
+            let path = entry.path();
+            if meta.is_file() {
+                files.push((path, meta));
+                checked.fetch_add(1, AtomicOrdering::Relaxed);
+            } else if meta.is_dir() && !is_system_folder(&entry.file_name()) && skip != Some(path.as_path()) {
+                folders.push(path);
+            }
+        }
+    }
+    Ok(pair_up(dir, files))
+}
+
+/// Turns the files found under `dir` into shots. Only files in the same folder pair up.
+fn pair_up(dir: &Path, mut files: Vec<(PathBuf, std::fs::Metadata)>) -> Vec<Shot> {
     // A set order, so the same file pairs up every time (see `taken` below).
     files.sort_by_key(|(p, _)| p.to_string_lossy().to_lowercase());
 
     let mut shots: BTreeMap<String, Shot> = BTreeMap::new();
     for (path, meta) in files {
+        // Which subfolder it's in, so IMG_1 in two folders stays two shots.
+        let folder = path.parent().and_then(|p| p.strip_prefix(dir).ok()).map(|p| p.to_string_lossy().to_lowercase().replace('\\', "/"));
+        let prefix = folder.filter(|f| !f.is_empty()).map(|f| f + "/").unwrap_or_default();
         let (Some(stem), Some(ext), Some(file)) = (
             path.file_stem().and_then(|s| s.to_str()),
             path.extension().and_then(|e| e.to_str()),
@@ -227,10 +281,10 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
         if !is_camera && !is_other && !is_raw {
             continue;
         }
-        let stem_key = stem.to_lowercase();
+        let stem_key = format!("{prefix}{}", stem.to_lowercase());
         // A second image or RAW of the same name (IMG_1.JPG + IMG_1.HEIC) is its own shot.
         let taken = shots.get(&stem_key).is_some_and(|s| if is_raw { s.raw.is_some() } else { s.image.is_some() });
-        let key = if is_other || taken { file.to_lowercase() } else { stem_key };
+        let key = if is_other || taken { format!("{prefix}{}", file.to_lowercase()) } else { stem_key };
         let shot = shots.entry(key.clone()).or_insert_with(|| Shot {
             name: stem.to_owned(),
             key,
@@ -247,12 +301,49 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
             shot.image = Some(path);
         }
     }
-    Ok(shots.into_values().collect())
+    shots.into_values().collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_search_finds_subfolders_and_keeps_same_names_apart() {
+        let dir = std::env::temp_dir().join(format!("cullery-drive-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for folder in ["", "100CANON", "101CANON", "Selects", ".Trashes", "Exports"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        for file in [
+            "top.jpg",
+            "100CANON/IMG_1.JPG",
+            "100CANON/IMG_1.CR3",
+            "101CANON/IMG_1.JPG",
+            ".Trashes/hidden.jpg",
+            "Exports/copy.jpg",
+        ] {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+
+        let checked = AtomicUsize::new(0);
+        let shots = scan_with_subfolders(&dir, Some(&dir.join("Exports")), &checked, &AtomicBool::new(false)).unwrap();
+        let mut found: Vec<(String, bool)> = shots.iter().map(|s| (s.key.clone(), s.raw.is_some())).collect();
+        found.sort();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            found,
+            [("100canon/img_1".to_string(), true), ("101canon/img_1".to_string(), false), ("top".to_string(), false)]
+        );
+        assert_eq!(checked.load(AtomicOrdering::Relaxed), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_a_whole_drive_counts_as_one() {
+        assert!(is_drive_root(Path::new(r"F:\")));
+        assert!(!is_drive_root(Path::new(r"F:\DCIM")));
+    }
 
     #[test]
     fn summary_names_each_files_type_and_size() {
