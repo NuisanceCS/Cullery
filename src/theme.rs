@@ -57,7 +57,8 @@ impl ThemeId {
     pub fn subtitle(self) -> &'static str {
         match self {
             ThemeId::AppleDark | ThemeId::AppleLight => "Rounded, macOS colors",
-            ThemeId::Win11Dark | ThemeId::Win11Light => "Fluent, Mica top bar",
+            ThemeId::Win11Dark | ThemeId::Win11Light if cfg!(windows) => "Fluent, Mica top bar",
+            ThemeId::Win11Dark | ThemeId::Win11Light => "Fluent colors",
             ThemeId::Win10Dark | ThemeId::Win10Light => "Flat and square",
         }
     }

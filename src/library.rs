@@ -113,6 +113,8 @@ pub struct Shot {
     /// When the shown file was last modified, and its size in bytes (for sorting).
     pub modified: Option<SystemTime>,
     pub size: u64,
+    /// The size of the RAW file, in bytes.
+    pub raw_size: u64,
 }
 
 impl Shot {
@@ -152,9 +154,39 @@ impl Shot {
         extension(self.image.as_deref()).is_some_and(|e| CAMERA_IMAGE_EXTENSIONS.contains(&e.as_str()))
     }
 
+    /// What the viewer says about this shot's files, like
+    /// "JPEG Paired with CR3 - 1 MB and 12 MB".
+    pub fn summary(&self) -> String {
+        let kind = match self.image_kind().as_str() {
+            "JPG" => "JPEG".to_string(),
+            other => other.to_string(),
+        };
+        match (&self.image, &self.raw) {
+            (Some(_), Some(_)) => {
+                format!("{kind} Paired with {} - {} and {}", self.raw_kind(), size_text(self.size), size_text(self.raw_size))
+            }
+            (Some(_), None) if self.is_camera_image() => format!("{kind}, no RAW - {}", size_text(self.size)),
+            (Some(_), None) => format!("{kind} image - {}", size_text(self.size)),
+            _ => format!("{} RAW only - {}", self.raw_kind(), size_text(self.raw_size)),
+        }
+    }
+
     /// The file to show: the image, or for RAW-only shots, the RAW's embedded preview.
     pub fn display_path(&self) -> Option<&PathBuf> {
         self.image.as_ref().or(self.raw.as_ref())
+    }
+}
+
+/// A file size for reading at a glance: "850 KB", "12 MB", "1.2 GB".
+fn size_text(bytes: u64) -> String {
+    let kb = bytes as f64 / 1024.0;
+    let mb = kb / 1024.0;
+    if mb < 1.0 {
+        format!("{} KB", kb.round().max(1.0))
+    } else if mb < 1024.0 {
+        format!("{} MB", mb.round())
+    } else {
+        format!("{:.1} GB", mb / 1024.0)
     }
 }
 
@@ -210,6 +242,7 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
         }
         if is_raw {
             shot.raw = Some(path);
+            shot.raw_size = meta.len();
         } else {
             shot.image = Some(path);
         }
@@ -220,6 +253,23 @@ pub fn scan(dir: &Path) -> io::Result<Vec<Shot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_names_each_files_type_and_size() {
+        const MB: u64 = 1024 * 1024;
+        let shot = |image: Option<&str>, raw: Option<&str>, size, raw_size| Shot {
+            image: image.map(PathBuf::from),
+            raw: raw.map(PathBuf::from),
+            size,
+            raw_size,
+            ..Default::default()
+        };
+        assert_eq!(shot(Some("a.JPG"), Some("a.CR3"), MB, 12 * MB).summary(), "JPEG Paired with CR3 - 1 MB and 12 MB");
+        assert_eq!(shot(Some("a.png"), None, 2 * MB, 0).summary(), "PNG image - 2 MB");
+        assert_eq!(shot(Some("a.jpg"), None, 850 * 1024, 0).summary(), "JPEG, no RAW - 850 KB");
+        assert_eq!(shot(None, Some("a.cr3"), 12 * MB, 12 * MB).summary(), "CR3 RAW only - 12 MB");
+        assert_eq!(size_text(1536 * MB), "1.5 GB");
+    }
 
     #[test]
     fn names_sort_like_file_explorer() {

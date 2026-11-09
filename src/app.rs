@@ -11,6 +11,8 @@ use eframe::egui::{
     ViewportCommand,
 };
 
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
 use crate::devices::{self, CardFolder};
 use crate::export::{self, Done, Exporter};
 use crate::library::{self, Shot, SortBy};
@@ -117,6 +119,9 @@ struct PendingDrag {
     count: String,
     note: String,
     shown: bool,
+    /// Set while macOS runs the drag (Windows is done before the app goes on); becomes
+    /// true on the drop or cancel.
+    ended: Option<Arc<AtomicBool>>,
 }
 
 enum Action {
@@ -236,8 +241,12 @@ pub struct App {
     settings_page: Option<SettingsPage>,
     /// Grid shows only picked photos.
     view_picked: bool,
-    /// The app window, for starting drags out of it (None in tests).
+    /// The app window (its HWND, or NSView on macOS), for starting drags out of it
+    /// (None in tests).
     hwnd: Option<isize>,
+    /// A macOS drag just ended. It kept the mouse-up, so the window still thinks the
+    /// button is held until it's told otherwise.
+    release_pointer: bool,
     /// Some photo in this folder has a RAW partner (else Show Paired RAW is hidden).
     has_raw_pairs: bool,
     /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
@@ -275,6 +284,7 @@ impl App {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         app.hwnd = cc.window_handle().ok().and_then(|h| match h.as_raw() {
             RawWindowHandle::Win32(w) => Some(w.hwnd.get()),
+            RawWindowHandle::AppKit(w) => Some(w.ns_view.as_ptr() as isize),
             _ => None,
         });
         if let Some(hwnd) = app.hwnd {
@@ -381,6 +391,7 @@ impl App {
             settings_page: None,
             view_picked: false,
             hwnd: None,
+            release_pointer: false,
             has_raw_pairs: false,
             last_drag: HashSet::new(),
             pending_drag: None,
@@ -849,14 +860,9 @@ impl App {
                 match self.screen {
                     Screen::Viewer if !self.shots.is_empty() => {
                         let shot = &self.shots[self.current];
-                        let (title, sub) = match (&shot.image, &shot.raw) {
-                            (Some(_), Some(_)) => (shot.image_name(), format!("Paired with {}", shot.raw_name())),
-                            (Some(_), None) if shot.is_camera_image() => (shot.image_name(), "No RAW".into()),
-                            (Some(_), None) => (shot.image_name(), format!("{} image", shot.image_kind())),
-                            _ => (shot.raw_name(), "RAW only".into()),
-                        };
+                        let title = if shot.image.is_some() { shot.image_name() } else { shot.raw_name() };
                         painter.text(center - vec2(0.0, 7.0), Align2::CENTER_CENTER, title, theme::font_semibold(13.5), p.label);
-                        painter.text(center + vec2(0.0, 10.0), Align2::CENTER_CENTER, sub, theme::font(11.0), p.label2);
+                        painter.text(center + vec2(0.0, 10.0), Align2::CENTER_CENTER, shot.summary(), theme::font(11.0), p.label2);
                     }
                     _ if self.folder.is_none() => {
                         painter.text(center, Align2::CENTER_CENTER, "Cullery", theme::font_semibold(13.5), p.label2);
@@ -1085,24 +1091,46 @@ impl App {
         // The window can't redraw while Windows runs the drag, so this frame shows the
         // overlay and the next one hands the drag to Windows (the overlay stays on screen
         // until the drop).
-        self.pending_drag = Some(PendingDrag { paths, stack, photos: shots.len(), title, count, note, shown: false });
+        self.pending_drag = Some(PendingDrag { paths, stack, photos: shots.len(), title, count, note, shown: false, ended: None });
         self.last_tile_click = None;
     }
 
     /// Starts the drag set up by `drag_out`, once its overlay has been on screen.
     fn start_pending_drag(&mut self, ctx: &egui::Context) {
+        // A drag macOS is running: the overlay stays up until it's over.
+        if let Some(ended) = self.pending_drag.as_ref().and_then(|d| d.ended.as_ref()) {
+            if ended.load(AtomicOrdering::SeqCst) {
+                self.pending_drag = None;
+                self.release_pointer = true;
+                ctx.request_repaint();
+            }
+            return;
+        }
         if !self.pending_drag.as_ref().is_some_and(|d| d.shown) {
             return;
         }
-        let Some(drag) = self.pending_drag.take() else { return };
+        let Some(mut drag) = self.pending_drag.take() else { return };
         let Some(hwnd) = self.hwnd else { return };
-        let scale = ctx.pixels_per_point();
+        // macOS sizes the picture in points and adds its own count, and there's no text
+        // drawing for a badge here.
+        let (scale, badge) = if cfg!(target_os = "macos") { (1.0, 1) } else { (ctx.pixels_per_point(), drag.photos) };
         let px = (110.0 * scale).round() as u32;
         let pictures: Vec<egui::ColorImage> =
             drag.stack.iter().filter_map(|p| crate::loader::quick_picture(p, [px, px])).collect();
-        let image = crate::dragimage::stack(&pictures, drag.photos, self.p.accent, scale);
-        if let Err(e) = crate::dragout::drag_files(hwnd, &drag.paths, Some(&image)) {
+        let image = crate::dragimage::stack(&pictures, badge, self.p.accent, scale);
+        let ended = Arc::new(AtomicBool::new(false));
+        let on_end = {
+            let (ended, ctx) = (ended.clone(), ctx.clone());
+            move || {
+                ended.store(true, AtomicOrdering::SeqCst);
+                ctx.request_repaint();
+            }
+        };
+        if let Err(e) = crate::dragout::drag_files(hwnd, &drag.paths, Some(&image), on_end) {
             self.error(format!("Couldn't start the drag: {e}"));
+        } else if !ended.load(AtomicOrdering::SeqCst) {
+            drag.ended = Some(ended);
+            self.pending_drag = Some(drag);
         }
     }
 
@@ -1121,7 +1149,10 @@ impl App {
             painter.layout_no_wrap(drag.note.clone(), theme::font(13.0), p.label2),
         ];
         center_card(&painter, screen.center(), &p, lines, &[10.0, 4.0], vec2(32.0, 28.0), p.separator);
-        ctx.request_repaint();
+        // The next frame starts the drag; once it's running, its end asks for a repaint.
+        if drag.ended.is_none() {
+            ctx.request_repaint();
+        }
     }
 
     /// The files to drag for these shots, per the Settings choice. A file already copied
@@ -1491,10 +1522,14 @@ impl App {
 
                 if !cards.is_empty() {
                     ui.add_space(24.0);
-                    section_label(ui, &p, "Memory Cards");
+                    section_label(ui, &p, if cfg!(target_os = "macos") { "Drives" } else { "Memory Cards" });
                     for card in &cards {
                         let heics = if card.heics > 0 { format!("{} HEIC · ", card.heics) } else { String::new() };
-                        let sub = format!("{} JPG · {heics}{} RAW", card.jpgs, card.raws);
+                        let sub = if card.jpgs + card.heics + card.raws == 0 {
+                            "External drive".to_string()
+                        } else {
+                            format!("{} JPG · {heics}{} RAW", card.jpgs, card.raws)
+                        };
                         if list_row(ui, &p, &card.path.display().to_string(), Some(&sub), None).clicked() {
                             open = Some(card.path.clone());
                         }
@@ -1826,7 +1861,10 @@ impl App {
         // File name, with a blue highlight when selected (like Finder).
         let name = if item.raw { shot.raw_name() } else { shot.image_name() };
         let name_color = if selected { p.on_accent } else { p.label };
-        let g = painter.layout_no_wrap(name, theme::font(12.5), name_color);
+        // Long names end in "…" at the tile's edge rather than running into the next tile.
+        let mut name_job = LayoutJob::simple_singleline(name, theme::font(12.5), name_color);
+        name_job.wrap = egui::text::TextWrapping::truncate_at_width(w - 12.0);
+        let g = painter.layout_job(name_job);
         let name_rect = Rect::from_center_size(
             pos2(thumb_rect.center().x, thumb_rect.max.y + 16.0),
             g.size() + vec2(12.0, 2.0),
@@ -2067,6 +2105,19 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if std::mem::take(&mut self.release_pointer) {
+            if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                raw_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: raw_input.modifiers,
+                });
+            }
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_ui(ctx);
     }
@@ -2483,7 +2534,7 @@ fn theme_card(ui: &mut Ui, p: &Palette, id: ThemeId, selected: bool) -> Response
     let r = t.r_card.min(10);
     painter.rect_filled(rect, r, t.bg);
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 22.0));
-    let bar_fill = if t.mica { t.mica_preview } else { t.bar };
+    let bar_fill = if t.mica && cfg!(windows) { t.mica_preview } else { t.bar };
     painter.rect_filled(bar, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, bar_fill);
     for i in 0..3 {
         let tile = Rect::from_min_size(rect.min + vec2(10.0 + i as f32 * 40.0, 30.0), vec2(34.0, 23.0));

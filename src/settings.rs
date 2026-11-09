@@ -93,15 +93,15 @@ impl DragFiles {
     pub fn label(self) -> &'static str {
         match self {
             DragFiles::Raw => "RAW files",
-            DragFiles::Jpg => "JPG files",
-            DragFiles::Both => "JPG + RAW",
+            DragFiles::Jpg => "Image files",
+            DragFiles::Both => "Image + RAW",
         }
     }
 
     pub fn description(self) -> &'static str {
         match self {
-            DragFiles::Raw => "Best for editing in Lightroom or LightCraft. Shots without a RAW send their JPG.",
-            DragFiles::Jpg => "For sharing or quick edits. Shots without a JPG send their RAW.",
+            DragFiles::Raw => "Best for editing in Lightroom or LightCraft. Shots without a RAW send their image file.",
+            DragFiles::Jpg => "The JPG, PNG or other image, for sharing or quick edits. Shots without one send their RAW.",
             DragFiles::Both => "Every file of each shot.",
         }
     }
@@ -109,9 +109,9 @@ impl DragFiles {
     /// The same choice, described for copying to the export folder.
     pub fn export_description(self) -> &'static str {
         match self {
-            DragFiles::Raw => "Just the RAW, to edit later. Shots without a RAW copy their JPG.",
-            DragFiles::Jpg => "Just the JPG, ready to share. Shots without a JPG copy their RAW.",
-            DragFiles::Both => "Both files of each shot: JPGs to send, RAWs to edit.",
+            DragFiles::Raw => "Just the RAW, to edit later. Shots without a RAW copy their image file.",
+            DragFiles::Jpg => "Just the JPG, PNG or other image, ready to share. Shots without one copy their RAW.",
+            DragFiles::Both => "Both files of each shot: images to send, RAWs to edit.",
         }
     }
 

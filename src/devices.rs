@@ -52,15 +52,38 @@ fn dcim_candidates() -> Vec<PathBuf> {
     (b'D'..=b'Z').map(|letter| PathBuf::from(format!("{}:\\DCIM", letter as char))).collect()
 }
 
-/// Where a memory card's DCIM folder could be. The startup disk is listed in /Volumes
-/// too, but has no DCIM folder at its root.
+/// Where a memory card's DCIM folder could be.
 #[cfg(target_os = "macos")]
 fn dcim_candidates() -> Vec<PathBuf> {
-    let Ok(volumes) = std::fs::read_dir("/Volumes") else { return Vec::new() };
-    let mut candidates: Vec<PathBuf> = volumes.filter_map(|e| e.ok()).map(|e| e.path().join("DCIM")).collect();
-    candidates.sort();
-    candidates
+    volumes().into_iter().map(|v| v.join("DCIM")).collect()
 }
+
+/// The drives plugged in. The startup disk is in /Volumes too, as a link to `/`.
+#[cfg(target_os = "macos")]
+fn volumes() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/Volumes") else { return Vec::new() };
+    let mut volumes: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .collect();
+    volumes.sort();
+    volumes
+}
+
+/// Lists the drives that aren't already shown through a DCIM folder of photos.
+#[cfg(target_os = "macos")]
+fn add_other_drives(found: &mut Vec<CardFolder>) {
+    for path in volumes() {
+        if !found.iter().any(|card| card.path.starts_with(&path)) {
+            found.push(CardFolder { path, jpgs: 0, heics: 0, raws: 0 });
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_other_drives(_found: &mut Vec<CardFolder>) {}
 
 fn scan() -> Vec<CardFolder> {
     let mut found = Vec::new();
@@ -96,5 +119,6 @@ fn scan() -> Vec<CardFolder> {
             }
         }
     }
+    add_other_drives(&mut found);
     found
 }

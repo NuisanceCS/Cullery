@@ -11,9 +11,9 @@ use crate::dragimage::DragImage;
 
 /// Drags `paths` out of the window `hwnd` (as a copy), with `image` under the cursor
 /// (else the shell's usual one). Returns once the user drops or cancels; the window
-/// doesn't redraw in the meantime.
+/// doesn't redraw in the meantime. `on_end` runs when the drag is over.
 #[cfg(windows)]
-pub fn drag_files(hwnd: isize, paths: &[PathBuf], image: Option<&DragImage>) -> Result<(), String> {
+pub fn drag_files(hwnd: isize, paths: &[PathBuf], image: Option<&DragImage>, on_end: impl Fn() + Send + 'static) -> Result<(), String> {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::Ole::{IDropSource, DROPEFFECT_COPY, DROPEFFECT_LINK};
     use windows::Win32::UI::Shell::SHDoDragDrop;
@@ -37,6 +37,7 @@ pub fn drag_files(hwnd: isize, paths: &[PathBuf], image: Option<&DragImage>) -> 
     // Tell it the button came up.
     // SAFETY: posts a message to our own window.
     let _ = unsafe { PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), LPARAM(0)) };
+    on_end();
     result.map(|_| ()).map_err(|e| e.message().to_string())
 }
 
@@ -320,7 +321,37 @@ mod tests {
     }
 }
 
-#[cfg(not(windows))]
-pub fn drag_files(_hwnd: isize, _paths: &[PathBuf], _image: Option<&DragImage>) -> Result<(), String> {
-    Err("Dragging photos out is only supported on Windows".into())
+/// Starts dragging `paths` out of the window whose NSView is `view`, as a copy, with
+/// `image` under the cursor. Unlike Windows, macOS returns at once and the app keeps
+/// running during the drag; `on_end` runs on the drop or cancel.
+#[cfg(target_os = "macos")]
+pub fn drag_files(view: isize, paths: &[PathBuf], image: Option<&DragImage>, on_end: impl Fn() + Send + 'static) -> Result<(), String> {
+    use raw_window_handle::{AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
+    struct View(NonNull<c_void>);
+    impl HasWindowHandle for View {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(self.0));
+            // SAFETY: this is Cullery's own view, which outlives the call using it.
+            Ok(unsafe { WindowHandle::borrow_raw(raw) })
+        }
+    }
+
+    let view = View(NonNull::new(view as *mut c_void).ok_or("The window isn't ready")?);
+    let png = image.ok_or("There's no drag picture")?.to_png()?;
+    drag::start_drag(
+        &view,
+        drag::DragItem::Files(paths.to_vec()),
+        drag::Image::Raw(png),
+        move |_result, _position| on_end(),
+        drag::Options::default(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn drag_files(_window: isize, _paths: &[PathBuf], _image: Option<&DragImage>, _on_end: impl Fn() + Send + 'static) -> Result<(), String> {
+    Err("Dragging photos out isn't supported on this system".into())
 }

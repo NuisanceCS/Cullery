@@ -9,7 +9,27 @@ use eframe::egui::{Color32, ColorImage};
 pub struct DragImage {
     pub size: [usize; 2],
     pub bgra: Vec<u8>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub hotspot: [i32; 2],
+}
+
+impl DragImage {
+    /// The picture as a PNG file's bytes, the form macOS takes it in.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn to_png(&self) -> Result<Vec<u8>, String> {
+        let mut rgba = Vec::with_capacity(self.bgra.len());
+        for pixel in self.bgra.chunks_exact(4) {
+            let alpha = pixel[3] as u32;
+            // Undo the premultiplying.
+            let straight = |c: u8| if alpha == 0 { 0 } else { ((c as u32 * 255 + alpha / 2) / alpha).min(255) as u8 };
+            rgba.extend_from_slice(&[straight(pixel[2]), straight(pixel[1]), straight(pixel[0]), pixel[3]]);
+        }
+        let picture = image::RgbaImage::from_raw(self.size[0] as u32, self.size[1] as u32, rgba)
+            .ok_or("The drag picture has the wrong size")?;
+        let mut png = Vec::new();
+        picture.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        Ok(png)
+    }
 }
 
 /// Long edge of each photo card, at 100% display scaling.
@@ -280,6 +300,17 @@ fn text_mask(_text: &str, _px: i32) -> Option<TextMask> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_keeps_size_and_undoes_premultiplying() {
+        // Half-transparent red, premultiplied: B 0, G 0, R 128, A 128.
+        let image = DragImage { size: [2, 1], bgra: vec![0, 0, 128, 128, 0, 0, 0, 0], hotspot: [0, 0] };
+        let png = image.to_png().unwrap();
+        let back = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(back.dimensions(), (2, 1));
+        assert_eq!(back.get_pixel(0, 0).0, [255, 0, 0, 128]);
+        assert_eq!(back.get_pixel(1, 0).0, [0, 0, 0, 0]);
+    }
 
     fn photo(w: usize, h: usize, c: Color32) -> ColorImage {
         ColorImage::new([w, h], vec![c; w * h])
