@@ -440,7 +440,10 @@ mod tests {
     use super::*;
 
     /// Plays a real clip (muted) and gets frames out of it.
+    /// Needs a PC with Windows' video features, which the build servers lack:
+    /// cargo test --release plays_a_clip -- --ignored --nocapture
     #[test]
+    #[ignore]
     fn plays_a_clip() {
         let path = std::env::var_os("CULLERY_VIDEO_SAMPLE").map(std::path::PathBuf::from).unwrap_or_else(|| {
             r"C:\Windows\SystemApps\Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy\media\oobe-intro.mp4".into()

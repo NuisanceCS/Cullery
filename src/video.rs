@@ -138,7 +138,10 @@ mod tests {
     use super::*;
 
     /// A video that comes with Windows: its preview should be a real picture.
+    /// Needs a PC with Windows' video features, which the build servers lack:
+    /// cargo test --release windows_makes_a_frame -- --ignored --nocapture
     #[test]
+    #[ignore]
     fn windows_makes_a_frame() {
         let path = std::env::var_os("CULLERY_VIDEO_SAMPLE").map(std::path::PathBuf::from).unwrap_or_else(|| {
             r"C:\Windows\SystemApps\Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy\media\oobe-intro.mp4".into()
