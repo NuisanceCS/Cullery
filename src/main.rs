@@ -11,11 +11,13 @@ mod keybinds;
 mod library;
 mod loader;
 mod picks;
+mod player;
 mod platform;
 mod raw;
 mod settings;
 mod theme;
 mod update;
+mod video;
 mod wic;
 mod window;
 

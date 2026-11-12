@@ -128,7 +128,7 @@ pub fn decode(_path: &Path, _max: [u32; 2]) -> Result<Decoded, String> {
 
 #[cfg(target_os = "macos")]
 #[allow(non_upper_case_globals, non_snake_case)]
-mod mac {
+pub mod mac {
     use std::ffi::c_void;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
@@ -241,35 +241,50 @@ mod mac {
                 &kCFTypeDictionaryValueCallBacks,
             ))?;
             let image = owned(CGImageSourceCreateThumbnailAtIndex(source.0, 0, options.0))?;
+            let (rgba, size) = pixels(image.0)?;
+            let original = if sideways { [h, w] } else { [w, h] };
+            Ok(Decoded { rgba, size, original, orientation })
+        }
+    }
 
-            let (width, height) = (CGImageGetWidth(image.0), CGImageGetHeight(image.0));
-            let mut rgba = vec![0_u8; width * height * 4];
-            let space = owned(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))?;
-            let context = owned(CGBitmapContextCreate(
-                rgba.as_mut_ptr() as *mut c_void,
-                width,
-                height,
-                8,
-                width * 4,
-                space.0,
-                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
-            ))?;
-            CGContextDrawImage(context.0, CGRect { x: 0.0, y: 0.0, width: width as f64, height: height as f64 }, image.0);
-            drop(context);
+    /// A CGImage's pixels as straight (not premultiplied) RGBA, and its size.
+    ///
+    /// # Safety
+    /// `image` must be a valid CGImage.
+    pub unsafe fn pixels(image: CFTypeRef) -> Result<(Vec<u8>, [u32; 2]), String> {
+        let (width, height) = (CGImageGetWidth(image), CGImageGetHeight(image));
+        let mut rgba = vec![0_u8; width * height * 4];
+        let space = owned(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))?;
+        let context = owned(CGBitmapContextCreate(
+            rgba.as_mut_ptr() as *mut c_void,
+            width,
+            height,
+            8,
+            width * 4,
+            space.0,
+            K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST,
+        ))?;
+        CGContextDrawImage(context.0, CGRect { x: 0.0, y: 0.0, width: width as f64, height: height as f64 }, image);
+        drop(context);
 
-            // The bitmap is premultiplied; the rest of the app expects straight alpha.
-            for pixel in rgba.chunks_exact_mut(4) {
-                let alpha = pixel[3] as u32;
-                if alpha != 0 && alpha != 255 {
-                    for channel in &mut pixel[..3] {
-                        *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
-                    }
+        // The bitmap is premultiplied; the rest of the app expects straight alpha.
+        for pixel in rgba.chunks_exact_mut(4) {
+            let alpha = pixel[3] as u32;
+            if alpha != 0 && alpha != 255 {
+                for channel in &mut pixel[..3] {
+                    *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
                 }
             }
-
-            let original = if sideways { [h, w] } else { [w, h] };
-            Ok(Decoded { rgba, size: [width as u32, height as u32], original, orientation })
         }
+        Ok((rgba, [width as u32, height as u32]))
+    }
+
+    /// Releases a Core Foundation object (a CGImage, say).
+    ///
+    /// # Safety
+    /// `object` must be a non-null object the caller owns.
+    pub unsafe fn release(object: CFTypeRef) {
+        CFRelease(object)
     }
 }
 

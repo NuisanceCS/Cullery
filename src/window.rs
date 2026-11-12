@@ -76,7 +76,8 @@ pub fn set_icons(hwnd: isize) {
 #[cfg(not(windows))]
 pub fn set_icons(_hwnd: isize) {}
 
-/// Opens a link (here: a Microsoft Store page) with whatever Windows uses for it.
+/// Opens a link or a file with whatever the system uses for it (a Microsoft Store page,
+/// the download page, a video clip in the video player).
 #[cfg(windows)]
 pub fn open_link(url: &str) {
     use windows::core::{HSTRING, PCWSTR};

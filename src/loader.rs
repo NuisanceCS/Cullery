@@ -197,7 +197,12 @@ fn decode(path: &Path, kind: Kind, max: [u32; 2]) -> (Result<(ColorImage, [u32; 
     std::panic::catch_unwind(|| {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
         let mut animation = Vec::new();
-        let image = if raw::is_raw_extension(&ext) {
+        let image = if crate::library::is_video_extension(&ext) {
+            match kind {
+                Kind::Preview => Err("no embedded thumbnail".to_string()),
+                _ => decode_video_frame(path, max),
+            }
+        } else if raw::is_raw_extension(&ext) {
             decode_raw(path, kind, max)
         } else if IMAGE_CRATE_EXTENSIONS.contains(&ext.as_str()) || WINDOWS_DECODED_EXTENSIONS.contains(&ext.as_str()) {
             match kind {
@@ -294,6 +299,14 @@ fn decode_with_image_crate(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u
     let original = [img.width(), img.height()];
     let rgba = fit_within(img.into_rgba8(), max);
     Ok((to_color_image(&rgba), original))
+}
+
+/// A still frame of a video clip, from the system.
+fn decode_video_frame(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    let (rgba, [w, h]) = crate::video::frame(path, max)?;
+    let img = RgbaImage::from_raw(w, h, rgba).ok_or("pixel buffer size mismatch")?;
+    let img = fit_within(img, max);
+    Ok((to_color_image(&img), [w, h]))
 }
 
 /// HEIC / HEIF / AVIF through Windows' own decoders.

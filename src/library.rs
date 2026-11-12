@@ -18,6 +18,21 @@ use crate::raw;
 pub const CAMERA_IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "heic", "heif"];
 /// Images shown on their own, never paired.
 const OTHER_IMAGE_EXTENSIONS: &[&str] = &["png", "gif", "webp", "tif", "tiff", "bmp", "avif"];
+/// Video clips. HEVC (H.265) isn't a file type of its own: it's inside MP4 and MOV.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mts", "m2ts"];
+/// RAW video, which pairs with a clip of the same name: Canon Cinema RAW Light,
+/// Blackmagic RAW and RED.
+pub const RAW_VIDEO_EXTENSIONS: &[&str] = &["crm", "braw", "r3d"];
+
+/// Whether files with this extension (lowercase) are videos, RAW or not.
+pub fn is_video_extension(ext: &str) -> bool {
+    VIDEO_EXTENSIONS.contains(&ext) || RAW_VIDEO_EXTENSIONS.contains(&ext)
+}
+
+/// Splits shots into (photos, videos), keeping their order.
+pub fn split_videos(shots: Vec<Shot>) -> (Vec<Shot>, Vec<Shot>) {
+    shots.into_iter().partition(|s| !s.video)
+}
 
 /// What the grid is ordered by, like File Explorer's Sort by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,6 +132,8 @@ pub struct Shot {
     pub size: u64,
     /// The size of the RAW file, in bytes.
     pub raw_size: u64,
+    /// A video clip: `image` is the clip, `raw` its RAW video.
+    pub video: bool,
 }
 
 impl Shot {
@@ -168,6 +185,7 @@ impl Shot {
                 format!("{kind} Paired with {} - {} and {}", self.raw_kind(), size_text(self.size), size_text(self.raw_size))
             }
             (Some(_), None) if self.is_camera_image() => format!("{kind}, no RAW - {}", size_text(self.size)),
+            (Some(_), None) if self.video => format!("{kind} video - {}", size_text(self.size)),
             (Some(_), None) => format!("{kind} image - {}", size_text(self.size)),
             _ => format!("{} RAW only - {}", self.raw_kind(), size_text(self.raw_size)),
         }
@@ -277,17 +295,22 @@ fn pair_up(dir: &Path, mut files: Vec<(PathBuf, std::fs::Metadata)>) -> Vec<Shot
         let ext = ext.to_ascii_lowercase();
         let is_camera = CAMERA_IMAGE_EXTENSIONS.contains(&ext.as_str());
         let is_other = OTHER_IMAGE_EXTENSIONS.contains(&ext.as_str());
-        let is_raw = raw::is_raw_extension(&ext);
-        if !is_camera && !is_other && !is_raw {
+        let is_raw_video = RAW_VIDEO_EXTENSIONS.contains(&ext.as_str());
+        let video = is_raw_video || VIDEO_EXTENSIONS.contains(&ext.as_str());
+        let is_raw = is_raw_video || raw::is_raw_extension(&ext);
+        if !is_camera && !is_other && !is_raw && !video {
             continue;
         }
-        let stem_key = format!("{prefix}{}", stem.to_lowercase());
+        // Videos pair only with videos: an iPhone's IMG_1.HEIC and IMG_1.MOV stay apart.
+        let kind = if video { " (video)" } else { "" };
+        let stem_key = format!("{prefix}{}{kind}", stem.to_lowercase());
         // A second image or RAW of the same name (IMG_1.JPG + IMG_1.HEIC) is its own shot.
         let taken = shots.get(&stem_key).is_some_and(|s| if is_raw { s.raw.is_some() } else { s.image.is_some() });
-        let key = if is_other || taken { format!("{prefix}{}", file.to_lowercase()) } else { stem_key };
+        let key = if is_other || taken { format!("{prefix}{}{kind}", file.to_lowercase()) } else { stem_key };
         let shot = shots.entry(key.clone()).or_insert_with(|| Shot {
             name: stem.to_owned(),
             key,
+            video,
             ..Default::default()
         });
         if !is_raw || shot.image.is_none() {
@@ -336,6 +359,27 @@ mod tests {
             [("100canon/img_1".to_string(), true), ("101canon/img_1".to_string(), false), ("top".to_string(), false)]
         );
         assert_eq!(checked.load(AtomicOrdering::Relaxed), 4);
+    }
+
+    #[test]
+    fn videos_pair_with_raw_video_but_not_with_photos() {
+        let dir = std::env::temp_dir().join(format!("cullery-video-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["A001.MP4", "A001.CRM", "IMG_1.HEIC", "IMG_1.MOV", "B002.braw"] {
+            std::fs::write(dir.join(file), b"x").unwrap();
+        }
+        let (photos, videos) = split_videos(scan(&dir).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(photos.len(), 1);
+        let summary: Vec<(String, bool, bool)> = videos.iter().map(|s| (s.name.clone(), s.image.is_some(), s.raw.is_some())).collect();
+        assert_eq!(
+            summary,
+            [("A001".to_string(), true, true), ("B002".to_string(), false, true), ("IMG_1".to_string(), true, false)]
+        );
+        assert_eq!(videos[0].summary(), "MP4 Paired with CRM - 1 KB and 1 KB");
+        assert_eq!(videos[2].summary(), "MOV video - 1 KB");
     }
 
     #[cfg(windows)]

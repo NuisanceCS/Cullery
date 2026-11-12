@@ -72,6 +72,12 @@ const MOUSE_CONTROLS: &[(&str, &str)] = &[
     ("Mouse back button", "Back to the grid"),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Media {
+    Photos,
+    Videos,
+}
+
 /// What the user did on the Keybinds page.
 enum KeybindChange {
     None,
@@ -147,6 +153,16 @@ struct Thumb {
     last_used: u64,
 }
 
+/// A clip playing (or paused) in the viewer.
+struct Playback {
+    shot: usize,
+    player: crate::player::Player,
+    /// The newest frame.
+    texture: Option<TextureHandle>,
+    /// The volume has been set again since the clip started playing.
+    audio_settled: bool,
+}
+
 struct FullImage {
     tex: TextureHandle,
     /// The photo's real size in pixels.
@@ -219,6 +235,17 @@ pub struct App {
 
     folder: Option<PathBuf>,
     shots: Vec<Shot>,
+    /// Photos or videos: the grid shows one kind at a time.
+    media: Media,
+    /// The open folder's shots of the other kind, set aside until the switch flips.
+    other_shots: Vec<Shot>,
+    /// The clip playing in the viewer.
+    playback: Option<Playback>,
+    /// Clips' volume (0 to 1) and mute, kept from clip to clip until Cullery closes.
+    volume: f32,
+    muted: bool,
+    /// The viewer fills the screen, with the bars hidden.
+    fullscreen: bool,
     picked: HashSet<usize>,
     selected: HashSet<usize>,
     /// Where a Shift+click range starts (the last plain or Ctrl click).
@@ -344,9 +371,12 @@ impl App {
     /// Opens the viewer at this file of the open folder.
     fn show_file(&mut self, path: &Path) {
         let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        let found = self.shots.iter().position(|s| {
-            s.files().any(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == name))
-        });
+        let is_it = |s: &Shot| s.files().any(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == name));
+        // A video named while photos are showing (or the other way round): switch first.
+        if !self.shots.iter().any(is_it) && self.other_shots.iter().any(is_it) {
+            self.switch_media(if self.media == Media::Photos { Media::Videos } else { Media::Photos });
+        }
+        let found = self.shots.iter().position(is_it);
         match found {
             Some(shot) => self.open_viewer(shot),
             None => self.error(format!("{} isn't a photo Cullery can open", path.display())),
@@ -395,6 +425,12 @@ impl App {
             cards: devices::watch(ctx),
             folder: None,
             shots: Vec::new(),
+            media: Media::Photos,
+            other_shots: Vec::new(),
+            playback: None,
+            volume: 1.0,
+            muted: false,
+            fullscreen: false,
             picked: HashSet::new(),
             selected: HashSet::new(),
             select_anchor: None,
@@ -488,9 +524,8 @@ impl App {
         };
         let Some(scan) = self.drive_scan.take() else { return };
         if scan.refresh {
-            if let Ok(mut shots) = result {
-                library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
-                self.adopt_shots(shots);
+            if let Ok(shots) = result {
+                self.adopt_rescan(shots);
             }
             return;
         }
@@ -537,6 +572,12 @@ impl App {
         match result {
             Ok(mut shots) => {
                 library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
+                // Photos first; a folder with only videos opens on its videos.
+                let (photos, videos) = library::split_videos(shots);
+                let (media, shots, other) =
+                    if photos.is_empty() && !videos.is_empty() { (Media::Videos, videos, photos) } else { (Media::Photos, photos, videos) };
+                self.media = media;
+                self.other_shots = other;
                 self.generation = self.loader.reset();
                 self.thumbs.clear();
                 self.fulls.clear();
@@ -625,6 +666,221 @@ impl App {
         let Some(folder) = &self.folder else { return };
         let current = self.picked.iter().map(|&i| (self.shots[i].key.clone(), Some(self.shots[i].size)));
         picks::save(folder, current.chain(self.other_picks.iter().cloned()));
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        if self.fullscreen != on {
+            self.fullscreen = on;
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(on));
+        }
+    }
+
+    /// Jumps the playing clip by `seconds` (back when negative).
+    fn skip_clip(&mut self, seconds: f64) {
+        let Some(pb) = self.playback.as_ref().filter(|pb| pb.shot == self.current) else { return };
+        let to = pb.player.position() + seconds;
+        pb.player.seek(match pb.player.duration() {
+            Some(d) => to.clamp(0.0, d),
+            None => to.max(0.0),
+        });
+    }
+
+    /// Plays or pauses the clip in the viewer, starting it if it isn't loaded yet.
+    fn toggle_playback(&mut self) {
+        if let Some(pb) = &self.playback {
+            if pb.shot == self.current {
+                if pb.player.is_playing() {
+                    pb.player.pause();
+                } else {
+                    pb.player.play();
+                }
+                return;
+            }
+        }
+        let Some(shot) = self.shots.get(self.current) else { return };
+        let Some(path) = shot.image.clone().filter(|p| shot.video && crate::player::can_play(p)) else { return };
+        match crate::player::Player::open(&path) {
+            Ok(player) => {
+                // Sound on, at the level chosen for the last clip.
+                player.set_volume(self.volume);
+                player.set_muted(self.muted);
+                player.play();
+                self.playback = Some(Playback { shot: self.current, player, texture: None, audio_settled: false });
+            }
+            Err(e) => self.error(e),
+        }
+    }
+
+    /// The clip playing in the viewer, with its controls. Returns false when no clip is
+    /// loaded for the photo on show, leaving the viewer to draw it as usual.
+    fn draw_playback(&mut self, ui: &mut Ui, area: Rect, resp: &Response) -> bool {
+        let Some(mut pb) = self.playback.take() else { return false };
+        if pb.shot != self.current {
+            self.playback = Some(pb);
+            return false;
+        }
+        let p = self.p;
+        let ctx = ui.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let max = [(area.width() * ppp).max(1.0) as u32, (area.height() * ppp).max(1.0) as u32];
+        if let Some(image) = pb.player.frame(max) {
+            match &mut pb.texture {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => pb.texture = Some(ctx.load_texture("video-frame", image, egui::TextureOptions::LINEAR)),
+            }
+            // Windows' player only starts its sound once the volume changes after the
+            // clip is under way: set it again (nudged, so it counts as a change).
+            if !pb.audio_settled && pb.player.position() > 0.0 {
+                let nudged = if self.volume > 0.5 { self.volume - 0.01 } else { self.volume + 0.01 };
+                pb.player.set_volume(nudged);
+                pb.player.set_volume(self.volume);
+                pb.player.set_muted(!self.muted);
+                pb.player.set_muted(self.muted);
+                pb.audio_settled = true;
+            }
+        }
+
+        // The newest frame, or the still frame until the first one arrives.
+        let picture = pb
+            .texture
+            .as_ref()
+            .map(|t| (t.id(), t.size_vec2()))
+            .or_else(|| self.fulls.get(&pb.shot).map(|f| (f.tex.id(), f.tex.size_vec2())));
+        if let Some((id, size)) = picture {
+            let fit = fit_rect(area, size);
+            Image::new((id, fit.size())).corner_radius(4).paint_at(ui, fit);
+        }
+        if pb.player.failed() {
+            ui.painter().text(area.center(), Align2::CENTER_CENTER, "This clip can't be played here", theme::font(14.0), Color32::WHITE);
+        }
+
+        // The control bar: play / pause, time, scrubber, mute, open in the video player.
+        let width = area.width().min(760.0) - 24.0;
+        let bar = Rect::from_min_size(pos2(area.center().x - width / 2.0, area.max.y - 56.0), vec2(width, 42.0));
+        let painter = ui.painter().clone();
+        painter.rect_filled(bar, 12, Color32::from_black_alpha(190));
+        let white = Color32::WHITE;
+        let dim = Color32::from_white_alpha(170);
+        let playing = pb.player.is_playing();
+        let duration = pb.player.duration();
+        let mut position = pb.player.position();
+
+        let play_rect = Rect::from_center_size(pos2(bar.min.x + 24.0, bar.center().y), Vec2::splat(32.0));
+        let play_tip = format!("{} ({})", if playing { "Pause" } else { "Play" }, self.settings.keybinds.main_text(KeyAction::PlayPause));
+        let play = ui.interact(play_rect, Id::new("clip-play-pause"), Sense::click()).on_hover_text(play_tip).on_hover_cursor(CursorIcon::PointingHand);
+        if playing {
+            for dx in [-4.0, 4.0] {
+                let r = Rect::from_center_size(play_rect.center() + vec2(dx, 0.0), vec2(4.0, 14.0));
+                painter.rect_filled(r, 1, white);
+            }
+        } else {
+            play_triangle(&painter, play_rect.center(), 7.0, white);
+        }
+
+        let open_g = painter.layout_no_wrap("Open in Player".to_string(), theme::font(12.5), dim);
+        let open_rect = Rect::from_min_size(pos2(bar.max.x - open_g.size().x - 18.0, bar.min.y + 7.0), vec2(open_g.size().x + 10.0, 28.0));
+        let open = ui.interact(open_rect, Id::new("clip-open"), Sense::click()).on_hover_text("Open the clip in your video player").on_hover_cursor(CursorIcon::PointingHand);
+        if open.hovered() {
+            painter.rect_filled(open_rect, 6, Color32::from_white_alpha(30));
+        }
+        painter.galley(open_rect.min + vec2(5.0, (28.0 - open_g.size().y) / 2.0), open_g, dim);
+
+        // Full screen.
+        let full_rect = Rect::from_center_size(pos2(open_rect.min.x - 20.0, bar.center().y), Vec2::splat(30.0));
+        let full_tip = format!(
+            "{} ({})",
+            if self.fullscreen { "Exit full screen" } else { "Full screen" },
+            self.settings.keybinds.main_text(KeyAction::FullScreen)
+        );
+        let full = ui.interact(full_rect, Id::new("clip-full"), Sense::click()).on_hover_text(full_tip).on_hover_cursor(CursorIcon::PointingHand);
+        fullscreen_icon(&painter, full_rect.center(), 7.0, if full.hovered() { white } else { dim }, self.fullscreen);
+
+        // Volume: a slider, and the speaker to mute. Both carry on to the next clip.
+        let volume_track = Rect::from_min_max(
+            pos2(full_rect.min.x - 10.0 - 72.0, bar.center().y - 2.0),
+            pos2(full_rect.min.x - 10.0, bar.center().y + 2.0),
+        );
+        let volume = ui.interact(volume_track.expand2(vec2(6.0, 12.0)), Id::new("clip-volume"), Sense::click_and_drag()).on_hover_cursor(CursorIcon::PointingHand);
+        if let Some(pos) = volume.interact_pointer_pos().filter(|_| volume.clicked() || volume.dragged()) {
+            self.volume = ((pos.x - volume_track.min.x) / volume_track.width()).clamp(0.0, 1.0);
+            self.muted = false;
+            pb.player.set_volume(self.volume);
+            pb.player.set_muted(false);
+        }
+        let shown_volume = if self.muted { 0.0 } else { self.volume };
+        volume.on_hover_text(format!("Volume {}%", (shown_volume * 100.0).round()));
+        painter.rect_filled(volume_track, 2, Color32::from_white_alpha(60));
+        let level = Rect::from_min_max(volume_track.min, pos2(volume_track.min.x + volume_track.width() * shown_volume, volume_track.max.y));
+        painter.rect_filled(level, 2, white);
+        painter.circle_filled(pos2(level.max.x, volume_track.center().y), 5.0, white);
+
+        let mute_rect = Rect::from_center_size(pos2(volume_track.min.x - 20.0, bar.center().y), Vec2::splat(30.0));
+        let mute = ui.interact(mute_rect, Id::new("clip-mute"), Sense::click()).on_hover_text(if self.muted { "Unmute" } else { "Mute" }).on_hover_cursor(CursorIcon::PointingHand);
+        let speaker = if self.muted || self.volume == 0.0 { "🔇" } else { "🔊" };
+        painter.text(mute_rect.center(), Align2::CENTER_CENTER, speaker, theme::font(15.0), if mute.hovered() { white } else { dim });
+
+        let time_text = |s: f64| {
+            let s = s.max(0.0).round() as u64;
+            format!("{}:{:02}", s / 60, s % 60)
+        };
+        let time = format!("{} / {}", time_text(position), duration.map_or("–:––".to_string(), time_text));
+        let time_g = painter.layout_no_wrap(time, theme::font(12.5), dim);
+        let time_pos = pos2(play_rect.max.x + 8.0, bar.center().y - time_g.size().y / 2.0);
+        let track_left = time_pos.x + time_g.size().x + 14.0;
+        painter.galley(time_pos, time_g, dim);
+
+        let track = Rect::from_min_max(pos2(track_left, bar.center().y - 2.0), pos2(mute_rect.min.x - 12.0, bar.center().y + 2.0));
+        let scrub = ui.interact(track.expand2(vec2(6.0, 12.0)), Id::new("clip-scrub"), Sense::click_and_drag()).on_hover_cursor(CursorIcon::PointingHand);
+        if let (Some(d), Some(pos)) = (duration, scrub.interact_pointer_pos()) {
+            if scrub.clicked() || scrub.dragged() {
+                let f = ((pos.x - track.min.x) / track.width()).clamp(0.0, 1.0) as f64;
+                position = f * d;
+                pb.player.seek(position);
+            }
+        }
+        let progress = duration.map_or(0.0, |d| (position / d).clamp(0.0, 1.0) as f32);
+        painter.rect_filled(track, 2, Color32::from_white_alpha(60));
+        let done = Rect::from_min_max(track.min, pos2(track.min.x + track.width() * progress, track.max.y));
+        painter.rect_filled(done, 2, p.accent);
+        painter.circle_filled(pos2(done.max.x, track.center().y), if scrub.hovered() || scrub.dragged() { 7.0 } else { 5.5 }, white);
+        // The time under the cursor, above the bar.
+        if let (Some(d), Some(pos)) = (duration, scrub.hover_pos().or(scrub.interact_pointer_pos())) {
+            let at = ((pos.x - track.min.x) / track.width()).clamp(0.0, 1.0) as f64 * d;
+            let g = painter.layout_no_wrap(time_text(at), theme::font_semibold(12.0), white);
+            let x = pos.x.clamp(track.min.x, track.max.x);
+            let label = Rect::from_center_size(pos2(x, bar.min.y - 16.0), g.size() + vec2(14.0, 6.0));
+            painter.rect_filled(label, 6, Color32::from_black_alpha(210));
+            painter.galley(label.center() - g.size() / 2.0, g, white);
+        }
+
+        // Clicking the picture (not the bar) plays or pauses.
+        let on_bar = resp.interact_pointer_pos().is_some_and(|pos| bar.contains(pos));
+        let toggle = play.clicked() || (resp.clicked() && !on_bar);
+        if mute.clicked() {
+            self.muted = !self.muted;
+            pb.player.set_muted(self.muted);
+        }
+        let toggle_full = full.clicked();
+        if open.clicked() {
+            pb.player.pause();
+            if let Some(path) = self.shots.get(pb.shot).and_then(|s| s.display_path()) {
+                crate::window::open_link(&path.to_string_lossy());
+            }
+        }
+        self.playback = Some(pb);
+        if toggle {
+            self.toggle_playback();
+        }
+        if toggle_full {
+            self.set_fullscreen(&ctx, !self.fullscreen);
+        }
+        // Frames keep coming while it plays; after a seek, the new frame arrives shortly.
+        if playing {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
+        }
+        true
     }
 
     fn toggle_pick(&mut self, shot: usize) {
@@ -942,6 +1198,27 @@ impl App {
                         }
                         self.recent_menu(ui, ctx);
                         if self.folder.is_some() {
+                            // Photos / Videos, when the folder has both.
+                            if !self.other_shots.is_empty() {
+                                ui.add_space(14.0);
+                                let mut switch_to = None;
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for (media, label) in [(Media::Photos, "Photos"), (Media::Videos, "Videos")] {
+                                        let on = self.media == media;
+                                        let mut b = Button::new(RichText::new(label).color(if on { p.on_accent } else { p.label }));
+                                        if on {
+                                            b = b.fill(p.accent).stroke(Stroke::new(1.0_f32, p.accent));
+                                        }
+                                        if ui.add(b).clicked() {
+                                            switch_to = Some(media);
+                                        }
+                                    }
+                                });
+                                if let Some(media) = switch_to {
+                                    self.switch_media(media);
+                                }
+                            }
                             if self.has_raw_pairs {
                                 ui.add_space(14.0);
                                 let on = self.settings.show_raw;
@@ -1056,6 +1333,7 @@ impl App {
     fn resort(&mut self) {
         let mut sorted = self.shots.clone();
         library::sort(&mut sorted, self.settings.sort_by, self.settings.sort_descending);
+        library::sort(&mut self.other_shots, self.settings.sort_by, self.settings.sort_descending);
         self.range = None;
         self.range_mode = RangeMode::Off;
         self.adopt_shots(sorted);
@@ -1472,6 +1750,8 @@ impl App {
     /// Starts deleting these shots' files in the background. `finish_delete` takes over
     /// when they're gone.
     fn delete_shots(&mut self, ctx: &egui::Context, shots: &[usize], permanent: bool) {
+        // A playing clip holds its file open, which would stop it being deleted.
+        self.playback = None;
         let files: Vec<PathBuf> = shots.iter().flat_map(|&s| self.shots[s].files().cloned()).collect();
         let job = export::Deletion::start(files, permanent, ctx.clone());
         self.deleting = Some(Deleting { job, shots: shots.to_vec(), permanent, started: ctx.input(|i| i.time) });
@@ -1548,9 +1828,39 @@ impl App {
             self.start_drive_scan(dir, None, true);
             return;
         }
-        let Ok(mut new_shots) = library::scan(&dir) else { return };
-        library::sort(&mut new_shots, self.settings.sort_by, self.settings.sort_descending);
-        self.adopt_shots(new_shots);
+        let Ok(new_shots) = library::scan(&dir) else { return };
+        self.adopt_rescan(new_shots);
+    }
+
+    /// Takes in a fresh scan of the open folder: the kind on show replaces the current
+    /// shots (keeping marks and thumbnails), the other kind is set aside.
+    fn adopt_rescan(&mut self, mut shots: Vec<Shot>) {
+        library::sort(&mut shots, self.settings.sort_by, self.settings.sort_descending);
+        let (photos, videos) = library::split_videos(shots);
+        let (current, other) = match self.media {
+            Media::Photos => (photos, videos),
+            Media::Videos => (videos, photos),
+        };
+        self.other_shots = other;
+        self.adopt_shots(current);
+    }
+
+    /// Flips the grid between photos and videos.
+    fn switch_media(&mut self, media: Media) {
+        if self.media == media {
+            return;
+        }
+        self.media = media;
+        std::mem::swap(&mut self.shots, &mut self.other_shots);
+        self.generation = self.loader.reset();
+        self.thumbs.clear();
+        self.fulls.clear();
+        self.original = None;
+        self.failed.clear();
+        self.has_raw_pairs = has_raw_pairs(&self.shots);
+        self.reset_view();
+        // The other kind's picks were kept aside; this brings this kind's back.
+        self.reload_picks();
     }
 
     /// Switches to a new list of the folder's shots, matching everything that refers
@@ -2008,6 +2318,12 @@ impl App {
             let text = help.map_or("No preview", |h| h.short);
             painter.text(thumb_rect.center(), Align2::CENTER_CENTER, text, theme::font(12.0), p.label2);
         }
+        if shot.video {
+            // A small play mark in the corner, so clips read as clips.
+            let badge = Rect::from_min_size(thumb_rect.left_bottom() + vec2(8.0, -26.0), vec2(28.0, 18.0));
+            painter.rect_filled(badge, 4, Color32::from_black_alpha(170));
+            play_triangle(painter, badge.center(), 5.0, Color32::WHITE);
+        }
         let hovered = resp.hovered() || circle.as_ref().is_some_and(|c| c.hovered());
         if resp.hovered() {
             painter.rect_filled(thumb_rect, p.r_thumb, Color32::from_white_alpha(12));
@@ -2092,6 +2408,9 @@ impl App {
         let p = self.p;
         let area = ui.available_rect_before_wrap();
         let resp = ui.allocate_rect(area, Sense::click_and_drag());
+        if self.draw_playback(ui, area, &resp) {
+            return;
+        }
         let shot = self.current;
         let ppp = ui.ctx().pixels_per_point();
         let max_zoom = MAX_ZOOM / ppp;
@@ -2200,6 +2519,30 @@ impl App {
                             ui.painter().text(area.center(), Align2::CENTER_CENTER, "Loading…", theme::font(14.0), p.label2);
                         }
                     }
+                }
+            }
+        }
+
+        // A clip: a Play button. MP4 and MOV play right here; RAW video opens in the
+        // system's video player.
+        let clip = self.shots[shot].video.then(|| self.shots[shot].display_path().cloned()).flatten();
+        if let (Some(path), true) = (clip, self.zoom.is_none()) {
+            let here = crate::player::can_play(&path);
+            let button = Rect::from_center_size(area.center(), Vec2::splat(76.0));
+            let tip = if here {
+                format!("Play ({})", self.settings.keybinds.main_text(KeyAction::PlayPause))
+            } else {
+                "Play in your video player".to_string()
+            };
+            let play = ui.interact(button, Id::new("play-clip"), Sense::click()).on_hover_text(tip).on_hover_cursor(CursorIcon::PointingHand);
+            let painter = ui.painter();
+            painter.circle_filled(button.center(), 38.0, Color32::from_black_alpha(if play.hovered() { 200 } else { 150 }));
+            play_triangle(painter, button.center(), 15.0, Color32::WHITE);
+            if play.clicked() {
+                if here {
+                    self.toggle_playback();
+                } else {
+                    crate::window::open_link(&path.to_string_lossy());
                 }
             }
         }
@@ -2323,6 +2666,14 @@ impl App {
     /// Everything drawn and handled in one frame.
     fn frame_ui(&mut self, ctx: &egui::Context) {
         self.frame += 1;
+        // A clip stops when its viewer closes or another photo shows.
+        if self.playback.as_ref().is_some_and(|pb| self.screen != Screen::Viewer || pb.shot != self.current) {
+            self.playback = None;
+        }
+        // Full screen belongs to the viewer.
+        if self.fullscreen && (self.screen != Screen::Viewer || self.shots.is_empty()) {
+            self.set_fullscreen(ctx, false);
+        }
         self.receive(ctx);
         self.finish_delete(ctx);
 
@@ -2336,6 +2687,10 @@ impl App {
             delete: bool,
             open: bool,
             settings: bool,
+            play: bool,
+            skip_back: bool,
+            skip_forward: bool,
+            fullscreen: bool,
             export: bool,
             select_all: bool,
             esc: bool,
@@ -2362,6 +2717,10 @@ impl App {
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
             delete: binds.pressed(KeyAction::Delete, i),
             settings: binds.pressed(KeyAction::Settings, i),
+            play: binds.pressed(KeyAction::PlayPause, i),
+            skip_back: binds.pressed(KeyAction::SkipBack, i),
+            skip_forward: binds.pressed(KeyAction::SkipForward, i),
+            fullscreen: binds.pressed(KeyAction::FullScreen, i),
         });
         // While the delete confirmation is up, it gets the keys (Esc cancels it); while
         // a delete runs, nothing should touch the photos.
@@ -2395,8 +2754,19 @@ impl App {
         }
         match self.screen {
             Screen::Viewer if !self.shots.is_empty() => {
-                if k.esc || k.back {
+                if (k.esc || k.back) && self.fullscreen {
+                    self.set_fullscreen(ctx, false);
+                } else if k.esc || k.back {
                     self.back_to_grid();
+                }
+                if k.fullscreen {
+                    self.set_fullscreen(ctx, !self.fullscreen);
+                }
+                if k.skip_back {
+                    self.skip_clip(-5.0);
+                }
+                if k.skip_forward {
+                    self.skip_clip(5.0);
                 }
                 if k.left {
                     self.step(-1);
@@ -2412,6 +2782,9 @@ impl App {
                 }
                 if k.pick {
                     self.toggle_pick(self.current);
+                }
+                if k.play {
+                    self.toggle_playback();
                 }
             }
             _ => {
@@ -2437,12 +2810,17 @@ impl App {
             }
         }
 
-        self.top_bar(ctx);
-        self.bottom_bar(ctx);
+        // Full screen is just the photo or clip.
+        if !self.fullscreen {
+            self.top_bar(ctx);
+            self.bottom_bar(ctx);
+        }
 
         let p = self.p;
         let viewer = self.screen == Screen::Viewer && !self.shots.is_empty();
-        let margin = if viewer {
+        let margin = if self.fullscreen {
+            Margin::ZERO
+        } else if viewer {
             Margin::same(24)
         } else if self.folder.is_some() {
             // Grid: the scroll bar sits against the window's right edge.
@@ -2450,7 +2828,8 @@ impl App {
         } else {
             Margin::same(16)
         };
-        let frame = Frame::new().fill(if viewer { p.viewer_bg } else { p.bg }).inner_margin(margin);
+        let fill = if self.fullscreen { Color32::BLACK } else if viewer { p.viewer_bg } else { p.bg };
+        let frame = Frame::new().fill(fill).inner_margin(margin);
         let panel = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             if self.folder.is_none() {
                 self.empty_screen(ui, ctx);
@@ -3094,6 +3473,28 @@ fn scrollbar(ui: &Ui, p: &Palette, rect: Rect, offset: f32, content_h: f32, view
     ((new - offset).abs() > 0.01).then_some(new)
 }
 
+/// Four corner brackets: pointing out for "full screen", in for "exit full screen".
+fn fullscreen_icon(painter: &egui::Painter, c: Pos2, r: f32, color: Color32, exit: bool) {
+    let stroke = Stroke::new(1.8_f32, color);
+    let arm = r * 0.55;
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let corner = c + vec2(sx * r, sy * r);
+        // Exiting: the brackets' corners point at the middle.
+        let (dx, dy) = if exit { (sx, sy) } else { (-sx, -sy) };
+        let tip = if exit { c + vec2(sx * (r - arm), sy * (r - arm)) } else { corner };
+        painter.line_segment([tip, tip + vec2(dx * arm, 0.0)], stroke);
+        painter.line_segment([tip, tip + vec2(0.0, dy * arm)], stroke);
+    }
+}
+
+/// A "play" triangle centered on `c`, `r` from its middle to each corner, nudged right
+/// so it looks centered.
+fn play_triangle(painter: &egui::Painter, c: Pos2, r: f32, color: Color32) {
+    let c = c + vec2(r * 0.2, 0.0);
+    let points = vec![c + vec2(-r * 0.75, -r), c + vec2(-r * 0.75, r), c + vec2(r, 0.0)];
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+}
+
 /// A small "!" in a filled circle, shown beside Settings when there's an update.
 fn update_button(ui: &mut Ui, p: &Palette) -> Response {
     let (rect, _) = ui.allocate_exact_size(vec2(30.0, 32.0), Sense::hover());
@@ -3520,6 +3921,53 @@ mod tests {
         h.app.shots = card_a;
         h.app.reload_picks();
         assert_eq!(h.app.picked, [1].into_iter().collect(), "the first card's pick came back");
+        cleanup(&dir);
+    }
+
+    /// F fills the screen in the viewer; Esc leaves full screen first, then the viewer.
+    #[test]
+    fn full_screen_and_back() {
+        let mut h = Harness::new();
+        h.app.settings.keybinds = keybinds::Keybinds::default();
+        let key = |k: KeyCode| Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        h.app.open_viewer(3);
+        h.frame(vec![], 0.016);
+        h.frame(vec![key(KeyCode::F)], 0.016);
+        assert!(h.app.fullscreen);
+        h.frame(vec![key(KeyCode::Escape)], 0.016);
+        assert!(!h.app.fullscreen && h.app.screen == Screen::Viewer, "Esc left full screen only");
+        h.frame(vec![key(KeyCode::F)], 0.016);
+        h.app.back_to_grid();
+        h.frame(vec![], 0.016);
+        assert!(!h.app.fullscreen, "leaving the viewer leaves full screen");
+    }
+
+    /// A folder with photos and videos shows photos first; the switch swaps them, and
+    /// each kind keeps its own picks.
+    #[test]
+    fn photos_and_videos_switch() {
+        let (mut h, dir) = harness_with_files("media");
+        h.app.settings.export_on_pick = false;
+        std::fs::write(dir.join("A001.MP4"), b"x").unwrap();
+        std::fs::write(dir.join("A001.CRM"), b"x").unwrap();
+        let ctx = h.ctx.clone();
+        h.app.finish_open(&ctx, dir.clone(), library::scan(&dir));
+        assert_eq!(h.app.media, Media::Photos);
+        assert_eq!((h.app.shots.len(), h.app.other_shots.len()), (6, 1));
+
+        h.app.selected = [2].into_iter().collect();
+        h.app.pick_selected();
+        h.app.switch_media(Media::Videos);
+        assert_eq!(h.app.shots.len(), 1);
+        assert!(h.app.shots[0].video && h.app.shots[0].raw.is_some(), "the clip is paired with its RAW");
+        assert!(h.app.picked.is_empty() && h.app.selected.is_empty());
+        h.app.selected = [0].into_iter().collect();
+        h.app.pick_selected();
+
+        h.app.switch_media(Media::Photos);
+        assert_eq!(h.app.picked, [2].into_iter().collect(), "the photo pick is still there");
+        h.app.switch_media(Media::Videos);
+        assert_eq!(h.app.picked, [0].into_iter().collect(), "and so is the video pick");
         cleanup(&dir);
     }
 
