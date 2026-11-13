@@ -48,6 +48,7 @@ enum SettingsPage {
     Keybinds,
     DragDrop,
     ExportOnPick,
+    Memory,
     Themes,
 }
 
@@ -58,6 +59,9 @@ enum ExportAction {
     TurnOff,
     ChooseFolder,
 }
+
+/// One photo's space in the viewer's strip.
+const STRIP_CELL: Vec2 = vec2(88.0, 62.0);
 
 /// The mouse controls listed on the Keybinds page: (what you do, what it does).
 const MOUSE_CONTROLS: &[(&str, &str)] = &[
@@ -217,6 +221,7 @@ struct LayoutKey {
     show_raw: bool,
     range_mode: bool,
     view_picked: bool,
+    view_rejected: bool,
     range: Option<(usize, usize)>,
     tile_width: i32,
 }
@@ -246,7 +251,18 @@ pub struct App {
     muted: bool,
     /// The viewer fills the screen, with the bars hidden.
     fullscreen: bool,
+    /// Camera details read for the details bar, by file.
+    info_cache: HashMap<PathBuf, crate::info::PhotoInfo>,
+    /// Photos read ahead of time, kept in memory: screen-sized, and small.
+    cache_keep: HashSet<usize>,
+    thumb_keep: HashSet<usize>,
+    /// Where reading ahead starts from on the grid: its first photo in view.
+    grid_anchor: usize,
+    /// The viewer's size in pixels, which screen-sized photos are read at.
+    viewer_px: [u32; 2],
     picked: HashSet<usize>,
+    /// Marked to delete later (View Rejected shows them together).
+    rejected: HashSet<usize>,
     selected: HashSet<usize>,
     /// Where a Shift+click range starts (the last plain or Ctrl click).
     select_anchor: Option<usize>,
@@ -276,6 +292,8 @@ pub struct App {
     settings_page: Option<SettingsPage>,
     /// Grid shows only picked photos.
     view_picked: bool,
+    /// Grid shows only rejected photos.
+    view_rejected: bool,
     /// The app window (its HWND, or NSView on macOS), for starting drags out of it
     /// (None in tests).
     hwnd: Option<isize>,
@@ -293,6 +311,7 @@ pub struct App {
     /// Remembered picks that aren't photos in the open folder right now, like another
     /// memory card's. Kept so saving this folder's picks doesn't lose them.
     other_picks: Vec<picks::Pick>,
+    other_rejects: Vec<picks::Pick>,
     /// Some photo in this folder has a RAW partner (else Show Paired RAW is hidden).
     has_raw_pairs: bool,
     /// Files in the last drag out of Cullery, so dropping them back on it is ignored.
@@ -431,7 +450,13 @@ impl App {
             volume: 1.0,
             muted: false,
             fullscreen: false,
+            info_cache: HashMap::new(),
+            cache_keep: HashSet::new(),
+            thumb_keep: HashSet::new(),
+            grid_anchor: 0,
+            viewer_px: [1920, 1080],
             picked: HashSet::new(),
+            rejected: HashSet::new(),
             selected: HashSet::new(),
             select_anchor: None,
             range: None,
@@ -450,6 +475,7 @@ impl App {
             double_click_time,
             settings_page: None,
             view_picked: false,
+            view_rejected: false,
             hwnd: None,
             release_pointer: false,
             new_version: Arc::default(),
@@ -457,6 +483,7 @@ impl App {
             rebinding: None,
             drive_scan: None,
             other_picks: Vec::new(),
+            other_rejects: Vec::new(),
             has_raw_pairs: false,
             last_drag: HashSet::new(),
             pending_drag: None,
@@ -612,6 +639,7 @@ impl App {
         self.range = None;
         self.range_mode = RangeMode::Off;
         self.view_picked = false;
+        self.view_rejected = false;
         self.confirm_delete = None;
         self.screen = Screen::Grid;
         self.current = 0;
@@ -660,12 +688,295 @@ impl App {
             }
         }
         self.other_picks = saved.into_iter().collect();
+        self.reload_rejects();
+    }
+
+    /// Rejects are remembered the same way as picks.
+    fn reload_rejects(&mut self) {
+        self.rejected.clear();
+        self.other_rejects.clear();
+        let Some(mut saved) = self.folder.as_deref().and_then(|f| picks::load_list(picks::List::Rejects, f)) else { return };
+        for (i, shot) in self.shots.iter().enumerate() {
+            let exact = saved.remove(&(shot.key.clone(), Some(shot.size)));
+            let from_older_version = saved.remove(&(shot.key.clone(), None));
+            if exact || from_older_version {
+                self.rejected.insert(i);
+            }
+        }
+        self.other_rejects = saved.into_iter().collect();
     }
 
     fn save_picks(&self) {
         let Some(folder) = &self.folder else { return };
         let current = self.picked.iter().map(|&i| (self.shots[i].key.clone(), Some(self.shots[i].size)));
         picks::save(folder, current.chain(self.other_picks.iter().cloned()));
+        let rejects = self.rejected.iter().map(|&i| (self.shots[i].key.clone(), Some(self.shots[i].size)));
+        picks::save_list(picks::List::Rejects, folder, rejects.chain(self.other_rejects.iter().cloned()));
+    }
+
+    /// Rejects or un-rejects shots. A rejected photo isn't picked, and the other way round.
+    fn set_rejected(&mut self, shots: &[usize], reject: bool) {
+        for &shot in shots {
+            if reject {
+                self.rejected.insert(shot);
+                self.picked.remove(&shot);
+            } else {
+                self.rejected.remove(&shot);
+            }
+        }
+        if self.view_picked {
+            let picked = &self.picked;
+            self.selected.retain(|s| picked.contains(s));
+        }
+        self.save_picks();
+    }
+
+    /// Grid: rejects every selected shot, or un-rejects them if they're all rejected.
+    /// Viewer: the photo on show.
+    fn reject_selected(&mut self) {
+        let mut shots: Vec<usize> = match self.screen {
+            Screen::Viewer => vec![self.current],
+            Screen::Grid => self.selected.iter().copied().collect(),
+        };
+        if shots.is_empty() {
+            return;
+        }
+        shots.sort_unstable();
+        let all_rejected = shots.iter().all(|s| self.rejected.contains(s));
+        self.set_rejected(&shots, !all_rejected);
+    }
+
+    /// Puts the selected photos' files (grid) or the shown photo's (viewer) on the
+    /// clipboard, to paste into a folder. The same files as dragging them out.
+    fn copy_selected(&mut self, ctx: &egui::Context) {
+        let mut shots: Vec<usize> = match self.screen {
+            Screen::Viewer => vec![self.current],
+            Screen::Grid => self.selected.iter().copied().collect(),
+        };
+        if shots.is_empty() {
+            return;
+        }
+        shots.sort_unstable();
+        let paths = self.drag_paths(&shots);
+        match crate::dragout::copy_files(&paths) {
+            Ok(()) => {
+                let n = shots.len();
+                self.show_toast(ctx, format!("Copied {n} {}  ·  paste them into a folder", plural(n, "photo", "photos")));
+            }
+            Err(e) => self.error(format!("Couldn't copy: {e}")),
+        }
+    }
+
+    fn set_view_rejected(&mut self, on: bool) {
+        self.view_rejected = on;
+        if on {
+            self.view_picked = false;
+            self.range_mode = RangeMode::Off;
+            let rejected = &self.rejected;
+            self.selected.retain(|s| rejected.contains(s));
+        }
+    }
+
+    /// The details bar along the top of the viewer, and the tab that hides and shows it
+    /// (just under the bar, or just under the top bar when hidden). Returns the space
+    /// left below.
+    fn viewer_info(&mut self, ui: &mut Ui, whole: Rect) -> Rect {
+        if self.fullscreen || self.shots.is_empty() {
+            return whole;
+        }
+        const BAR_H: f32 = 30.0;
+        const TAB_H: f32 = 14.0;
+        let p = self.p;
+        let shown = self.settings.info_bar;
+        let mut top = whole.min.y;
+        if shown {
+            let bar = Rect::from_min_size(whole.min + vec2(0.0, 6.0), vec2(whole.width(), BAR_H));
+            self.draw_info_bar(ui, bar);
+            top = bar.max.y + 2.0;
+        }
+        let tab_rect = Rect::from_center_size(pos2(whole.center().x, top + TAB_H / 2.0), vec2(72.0, TAB_H));
+        let tab = ui
+            .interact(tab_rect, Id::new("info-tab"), Sense::click())
+            .on_hover_text(if shown { "Hide the details bar" } else { "Show the details bar" })
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let pill = Rect::from_center_size(tab_rect.center(), vec2(if tab.hovered() { 52.0 } else { 44.0 }, 5.0));
+        ui.painter().rect_filled(pill, 3, if tab.hovered() { p.label } else { p.label2.gamma_multiply(0.7) });
+        if tab.clicked() {
+            self.settings.info_bar = !shown;
+            self.settings.save();
+        }
+        Rect::from_min_max(pos2(whole.min.x, tab_rect.max.y + 8.0), whole.max)
+    }
+
+    /// One line about the photo on show: where it is (click to open the folder), its
+    /// size, when it was taken, and the camera's settings. What doesn't fit is left off.
+    fn draw_info_bar(&mut self, ui: &mut Ui, bar: Rect) {
+        let p = self.p;
+        let shot = &self.shots[self.current];
+        let Some(path) = shot.display_path().cloned() else { return };
+        let (video, raw, modified) = (shot.video, shot.raw.clone(), shot.modified);
+        if self.info_cache.len() > 2000 {
+            self.info_cache.clear();
+        }
+        let info = self
+            .info_cache
+            .entry(path.clone())
+            .or_insert_with(|| {
+                // A JPG or HEIC has the camera details; a RAW-only shot's RAW may too.
+                let found = crate::info::read(&path);
+                match raw.filter(|r| *r != path && found == crate::info::PhotoInfo::default()) {
+                    Some(raw) => crate::info::read(&raw),
+                    None => found,
+                }
+            })
+            .clone();
+
+        ui.painter().rect_filled(bar, p.r_card, p.card);
+        let painter = ui.painter().with_clip_rect(bar.shrink(1.0));
+        let right = bar.max.x - 12.0;
+        let mut x = bar.min.x + 12.0;
+        let y = bar.center().y;
+
+        // Where it is: opens the folder with the file selected.
+        let folder = path.parent().unwrap_or(&path);
+        let location = painter.layout_no_wrap(short_path(folder), theme::font_semibold(12.5), p.tint);
+        let loc_rect = Rect::from_min_size(pos2(x, y - location.size().y / 2.0), location.size());
+        let open_in = if cfg!(target_os = "macos") { "Finder" } else { "File Explorer" };
+        let link = ui
+            .interact(loc_rect.intersect(bar), Id::new("info-location"), Sense::click())
+            .on_hover_text(format!("{}\nClick to show it in {open_in}", path.display()))
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if link.hovered() {
+            painter.line_segment([loc_rect.left_bottom(), loc_rect.right_bottom()], Stroke::new(1.0_f32, p.tint));
+        }
+        if link.clicked() {
+            crate::platform::reveal(&path);
+        }
+        x = loc_rect.max.x;
+        painter.galley(loc_rect.min, location, p.tint);
+
+        // The rest, most useful first, for as long as there's room.
+        let pixels = if video {
+            None
+        } else {
+            self.fulls.get(&self.current).map(|f| [f.original.x as u32, f.original.y as u32]).or(info.size)
+        };
+        let facts = [
+            pixels.map(|[w, h]| format!("{w} × {h}")),
+            info.taken.map(|t| format!("Taken {t}")),
+            info.camera,
+            info.shutter,
+            info.aperture,
+            info.iso,
+            info.focal,
+            info.lens,
+            modified.and_then(crate::platform::local_time).map(|t| format!("Modified {t}")),
+        ];
+        for fact in facts.into_iter().flatten() {
+            let g = painter.layout_no_wrap(format!("   ·   {fact}"), theme::font(12.5), p.label2);
+            if x + g.size().x > right {
+                break;
+            }
+            painter.galley(pos2(x, y - g.size().y / 2.0), g.clone(), p.label2);
+            x += g.size().x;
+        }
+    }
+
+    /// The strip of photos along the bottom of the viewer, and the tab that hides and
+    /// shows it (at the top of the strip, or just above the bar when hidden). Returns
+    /// the space left for the photo itself.
+    fn viewer_strip(&mut self, ui: &mut Ui, whole: Rect) -> Rect {
+        if self.fullscreen {
+            return whole;
+        }
+        const TAB_H: f32 = 14.0;
+        let p = self.p;
+        let shown = self.settings.filmstrip;
+        let strip = Rect::from_min_max(pos2(whole.min.x, whole.max.y - STRIP_CELL.y - 8.0), whole.max);
+        let tab_bottom = if shown { strip.min.y - 2.0 } else { whole.max.y };
+        let tab_rect = Rect::from_center_size(pos2(whole.center().x, tab_bottom - TAB_H / 2.0), vec2(72.0, TAB_H));
+        let tab = ui
+            .interact(tab_rect, Id::new("strip-tab"), Sense::click())
+            .on_hover_text(if shown { "Hide the photo strip" } else { "Show the photo strip" })
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let pill = Rect::from_center_size(tab_rect.center(), vec2(if tab.hovered() { 52.0 } else { 44.0 }, 5.0));
+        ui.painter().rect_filled(pill, 3, if tab.hovered() { p.label } else { p.label2.gamma_multiply(0.7) });
+        if tab.clicked() {
+            self.settings.filmstrip = !shown;
+            self.settings.save();
+        }
+        if shown {
+            self.draw_strip(ui, strip);
+        }
+        Rect::from_min_max(whole.min, pos2(whole.max.x, tab_rect.min.y - 8.0))
+    }
+
+    /// The photos of the working set in a row, centered on the one in the viewer.
+    /// Clicking one shows it.
+    fn draw_strip(&mut self, ui: &mut Ui, strip: Rect) {
+        const GAP: f32 = 6.0;
+        let p = self.p;
+        let set = self.working_set();
+        if set.is_empty() {
+            return;
+        }
+        let here = match set.binary_search(&self.current) {
+            Ok(i) | Err(i) => i.min(set.len() - 1),
+        };
+        let pitch = STRIP_CELL.x + GAP;
+        // Glides to the new photo rather than jumping.
+        let offset = ui.ctx().animate_value_with_time(Id::new("strip-scroll"), here as f32 * pitch, 0.18);
+        let x0 = strip.center().x - STRIP_CELL.x / 2.0 - offset;
+        let first = ((strip.min.x - x0) / pitch).floor().max(0.0) as usize;
+        let last = (((strip.max.x - x0) / pitch).ceil().max(0.0) as usize).min(set.len());
+
+        let painter = ui.painter().with_clip_rect(strip);
+        let mut visible = Vec::new();
+        let mut clicked = None;
+        for &shot in set.get(first..last).unwrap_or_default() {
+            let i = set.binary_search(&shot).unwrap_or(0);
+            let cell = Rect::from_min_size(pos2(x0 + i as f32 * pitch, strip.center().y - STRIP_CELL.y / 2.0), STRIP_CELL);
+            visible.push(shot);
+            painter.rect_filled(cell, 4, p.tile);
+            if let Some(t) = self.thumbs.get_mut(&shot) {
+                t.last_used = self.frame;
+                let fit = fit_rect(cell, t.tex.size_vec2());
+                painter.image(t.tex.id(), fit, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            let current = shot == self.current;
+            let r = ui
+                .interact(cell.intersect(strip), Id::new(("strip", shot)), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if current {
+                painter.rect_stroke(cell.expand(1.0), 5, Stroke::new(2.5_f32, p.accent), StrokeKind::Outside);
+            } else if !r.hovered() {
+                // The others a little dimmer, so the one on show stands out.
+                painter.rect_filled(cell, 4, Color32::from_black_alpha(80));
+            }
+            if self.picked.contains(&shot) {
+                let c = cell.right_top() + vec2(-9.0, 9.0);
+                painter.circle_filled(c, 6.5, p.accent);
+                check_mark(&painter, c, 3.0, p.on_accent);
+            }
+            if self.rejected.contains(&shot) {
+                let c = cell.right_top() + vec2(-9.0, 9.0);
+                painter.circle_filled(c, 6.5, theme::DELETE_RED);
+                x_mark(&painter, c, 2.6, Color32::WHITE);
+            }
+            if self.shots[shot].video {
+                play_triangle(&painter, cell.left_bottom() + vec2(10.0, -9.0), 4.0, Color32::WHITE);
+            }
+            if r.clicked() {
+                clicked = Some(shot);
+            }
+        }
+        self.request_thumbs(&visible, &[]);
+        if let Some(shot) = clicked {
+            if shot != self.current {
+                self.current = shot;
+                self.reset_zoom();
+            }
+        }
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
@@ -899,6 +1210,7 @@ impl App {
             }
             if pick {
                 self.picked.insert(shot);
+                self.rejected.remove(&shot);
                 if let Some(dest) = &dest {
                     let files = self.export_files(shot);
                     self.exporter.copy(files, dest.clone(), None);
@@ -979,10 +1291,71 @@ impl App {
             self.selected.insert(self.current);
             self.select_anchor = Some(self.current);
         }
-        self.fulls.clear();
+        // Photos read ahead stay in memory for next time; the rest go.
+        let keep = &self.cache_keep;
+        self.fulls.retain(|s, _| keep.contains(s));
         self.original = None;
         self.reset_zoom();
         self.loader.want_full(Vec::new());
+    }
+
+    /// Reads photos ahead of time, within the memory Settings allow: small versions of
+    /// every photo nearest to the one in view first (two ahead for every one behind),
+    /// then screen-sized ones with the memory left over. With "Use less memory" on,
+    /// only the photos right around the one on show are kept, as before.
+    fn read_ahead(&mut self) {
+        self.cache_keep.clear();
+        self.thumb_keep.clear();
+        let off = self.settings.memory_saver || self.folder.is_none() || self.drive_scan.is_some() || self.deleting.is_some();
+        let total = crate::platform::total_memory();
+        let (false, Some(total)) = (off, total) else {
+            self.loader.want_background(Vec::new());
+            if self.screen == Screen::Grid {
+                self.fulls.clear();
+            }
+            return;
+        };
+        let budget = (total as f64 * self.settings.memory_percent as f64 / 100.0) as u64;
+        let set = self.working_set();
+        let anchor = if self.screen == Screen::Viewer { self.current } else { self.grid_anchor };
+        let order = read_ahead_order(&set, anchor);
+
+        // What a small and a screen-sized photo take (pixels are 4 bytes; most photos are 3:2).
+        let thumb_bytes = THUMB_PX as u64 * THUMB_PX as u64 * 4 * 2 / 3;
+        let screen_bytes = (self.viewer_px[0] as u64 * self.viewer_px[1] as u64 * 4 * 2 / 3).max(1);
+        let thumbs = ((budget / thumb_bytes) as usize).min(order.len());
+        let left = budget.saturating_sub(thumbs as u64 * thumb_bytes);
+        let screens = ((left / screen_bytes) as usize).min(order.len());
+        self.thumb_keep = order[..thumbs].iter().copied().collect();
+        self.cache_keep = order[..screens].iter().copied().collect();
+
+        // A few at a time, nearest first: the queue is renewed every frame.
+        const BATCH: usize = 48;
+        let mut requests = Vec::new();
+        for &shot in &order[..thumbs] {
+            if requests.len() >= BATCH {
+                break;
+            }
+            let key = Key { shot, kind: Kind::Thumb };
+            let have = self.thumbs.get(&shot).is_some_and(|t| t.kind == Kind::Thumb);
+            if let (false, false, Some(path)) = (have, self.failed.contains_key(&key), self.shots[shot].display_path()) {
+                requests.push(Request { key, path: path.clone(), max: [THUMB_PX, THUMB_PX] });
+            }
+        }
+        for &shot in &order[..screens] {
+            if requests.len() >= BATCH {
+                break;
+            }
+            let key = Key { shot, kind: Kind::Full };
+            if let (false, false, Some(path)) = (self.fulls.contains_key(&shot), self.failed.contains_key(&key), self.shots[shot].display_path()) {
+                requests.push(Request { key, path: path.clone(), max: self.viewer_px });
+            }
+        }
+        self.loader.want_background(requests);
+        if self.screen == Screen::Grid {
+            let keep = &self.cache_keep;
+            self.fulls.retain(|s, _| keep.contains(s));
+        }
     }
 
     fn reset_zoom(&mut self) {
@@ -998,6 +1371,11 @@ impl App {
             let mut picked: Vec<usize> = self.picked.iter().copied().collect();
             picked.sort_unstable();
             return picked;
+        }
+        if self.view_rejected {
+            let mut rejected: Vec<usize> = self.rejected.iter().copied().collect();
+            rejected.sort_unstable();
+            return rejected;
         }
         match (self.range_mode, self.range) {
             (RangeMode::Off, Some((from, to))) => (from..=to).collect(),
@@ -1147,10 +1525,15 @@ impl App {
             }
         }
 
-        if self.thumbs.len() > MAX_THUMBS {
-            let mut by_age: Vec<(u64, usize)> = self.thumbs.iter().map(|(k, t)| (t.last_used, *k)).collect();
+        // Small versions read ahead are kept; of the rest, the least recently shown go.
+        let cap = MAX_THUMBS + self.thumb_keep.len();
+        if self.thumbs.len() > cap {
+            let keep = &self.thumb_keep;
+            let mut by_age: Vec<(u64, usize)> =
+                self.thumbs.iter().filter(|(k, _)| !keep.contains(k)).map(|(k, t)| (t.last_used, *k)).collect();
             by_age.sort_unstable();
-            for (_, shot) in by_age.iter().take(self.thumbs.len() - MAX_THUMBS * 4 / 5) {
+            let extra = self.thumbs.len() - (MAX_THUMBS * 4 / 5 + self.thumb_keep.len());
+            for (_, shot) in by_age.iter().take(extra) {
                 self.thumbs.remove(shot);
             }
         }
@@ -1274,7 +1657,7 @@ impl App {
     fn recent_menu(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let p = self.p;
         let title = match &self.folder {
-            Some(dir) => format!("{}     ", dir.display()),
+            Some(dir) => format!("{}     ", short_path(dir)),
             None => "Recent     ".to_string(),
         };
         let mut open = None;
@@ -1291,6 +1674,10 @@ impl App {
         });
         let r = menu.response.rect;
         chevron_down(ui.painter(), pos2(r.max.x - 16.0, r.center().y), 4.0, p.label2);
+        // A shortened path shows in full on hover.
+        if let Some(dir) = self.folder.as_ref().filter(|d| short_path(d) != d.display().to_string()) {
+            menu.response.on_hover_text(dir.display().to_string());
+        }
         if let Some(dir) = open {
             self.open_folder(ctx, dir);
         }
@@ -1417,6 +1804,7 @@ impl App {
             self.range_mode = if selecting { RangeMode::Off } else { RangeMode::PickStart };
             if !selecting {
                 self.view_picked = false;
+                self.view_rejected = false;
             }
         }
 
@@ -1461,6 +1849,22 @@ impl App {
             let tip = if on { "Show the whole folder again" } else { "Show only picked photos, ready to drag into Lightroom or LightCraft" };
             if ui.add(b).on_hover_text(tip).clicked() {
                 self.set_view_picked(!on);
+            }
+            // View Rejected: the rejects together, to check them and delete them in one go.
+            let on = self.view_rejected;
+            let red = theme::DELETE_RED;
+            let mut b = Button::new(RichText::new("View Rejected").color(if on { Color32::WHITE } else { p.label }));
+            // Red only while on, so it's clear the grid is showing just the rejects.
+            if on {
+                b = b.fill(red).stroke(Stroke::new(1.0_f32, red));
+            }
+            let tip = if on {
+                "Show the whole folder again".to_string()
+            } else {
+                format!("Show only rejected photos ({} to reject)", self.settings.keybinds.main_text(KeyAction::Reject))
+            };
+            if ui.add(b).on_hover_text(tip).clicked() {
+                self.set_view_rejected(!on);
             }
             self.picked_badge(ui);
             if !self.shots.is_empty() {
@@ -1874,6 +2278,7 @@ impl App {
 
         self.thumbs = std::mem::take(&mut self.thumbs).into_iter().filter_map(|(i, t)| Some((remap(i)?, t))).collect();
         self.picked = self.picked.iter().filter_map(|&i| remap(i)).collect();
+        self.rejected = self.rejected.iter().filter_map(|&i| remap(i)).collect();
         self.selected = self.selected.iter().filter_map(|&i| remap(i)).collect();
         self.select_anchor = self.select_anchor.and_then(remap);
         // The viewed photo: itself, or the nearest remaining one.
@@ -1905,6 +2310,7 @@ impl App {
     fn set_view_picked(&mut self, on: bool) {
         self.view_picked = on;
         if on {
+            self.view_rejected = false;
             self.range_mode = RangeMode::Off;
             // Keep only selections that are still visible.
             let picked = &self.picked;
@@ -2073,7 +2479,7 @@ impl App {
     /// Returns the scroll view's rect, offset, content height and row height.
     fn grid_contents(&mut self, ui: &mut Ui) -> Option<(Rect, f32, f32, f32)> {
         let p = self.p;
-        if self.view_picked || self.range_mode != RangeMode::Off || self.range.is_some() {
+        if self.view_picked || self.view_rejected || self.range_mode != RangeMode::Off || self.range.is_some() {
             self.range_banner(ui);
             ui.add_space(10.0);
         }
@@ -2094,6 +2500,7 @@ impl App {
             show_raw: self.settings.show_raw,
             range_mode: self.range_mode != RangeMode::Off,
             view_picked: self.view_picked,
+            view_rejected: self.view_rejected,
             range: self.range,
             tile_width: self.settings.tile_width.round() as i32,
         };
@@ -2184,6 +2591,9 @@ impl App {
             v
         };
         let visible = shots_in(visible_rows.clone());
+        if let Some(&first) = visible.first() {
+            self.grid_anchor = first;
+        }
         let mut ahead = shots_in(visible_rows.end..(visible_rows.end + LOOKAHEAD_ROWS).min(n_rows));
         ahead.extend(shots_in(visible_rows.start.saturating_sub(LOOKAHEAD_ROWS)..visible_rows.start));
         self.request_thumbs(&visible, &ahead);
@@ -2230,6 +2640,18 @@ impl App {
     fn range_banner(&mut self, ui: &mut Ui) {
         let p = self.p;
         let (text, button) = match (self.range_mode, self.range) {
+            _ if self.view_rejected => (
+                if self.rejected.is_empty() {
+                    "No rejected photos.".to_string()
+                } else {
+                    format!(
+                        "Showing your {} rejected photos  ·  to delete them all, select all ({}) and press Delete",
+                        self.rejected.len(),
+                        self.settings.keybinds.main_text(KeyAction::SelectAll)
+                    )
+                },
+                "Show All",
+            ),
             _ if self.view_picked => (
                 if self.picked.is_empty() {
                     "No picked photos yet.".to_string()
@@ -2267,8 +2689,9 @@ impl App {
                             .fill(Color32::TRANSPARENT)
                             .stroke(Stroke::NONE);
                         if ui.add(b).clicked() {
-                            if self.view_picked {
+                            if self.view_picked || self.view_rejected {
                                 self.view_picked = false;
+                                self.view_rejected = false;
                             } else if self.range_mode != RangeMode::Off {
                                 self.range_mode = RangeMode::Off;
                             } else {
@@ -2323,6 +2746,13 @@ impl App {
             let badge = Rect::from_min_size(thumb_rect.left_bottom() + vec2(8.0, -26.0), vec2(28.0, 18.0));
             painter.rect_filled(badge, 4, Color32::from_black_alpha(170));
             play_triangle(painter, badge.center(), 5.0, Color32::WHITE);
+        }
+        if self.rejected.contains(&item.shot) && !selecting {
+            // Rejected: dimmed, with a red ✕.
+            painter.rect_filled(thumb_rect, p.r_thumb, Color32::from_black_alpha(140));
+            let c = thumb_rect.right_bottom() + vec2(-16.0, -16.0);
+            painter.circle_filled(c, 10.0, theme::DELETE_RED);
+            x_mark(painter, c, 4.0, Color32::WHITE);
         }
         let hovered = resp.hovered() || circle.as_ref().is_some_and(|c| c.hovered());
         if resp.hovered() {
@@ -2406,8 +2836,11 @@ impl App {
 
     fn viewer_screen(&mut self, ui: &mut Ui) {
         let p = self.p;
-        let area = ui.available_rect_before_wrap();
+        let whole = ui.available_rect_before_wrap();
+        let below_info = self.viewer_info(ui, whole);
+        let area = self.viewer_strip(ui, below_info);
         let resp = ui.allocate_rect(area, Sense::click_and_drag());
+        let area_clicked = resp.clicked();
         if self.draw_playback(ui, area, &resp) {
             return;
         }
@@ -2538,13 +2971,25 @@ impl App {
             let painter = ui.painter();
             painter.circle_filled(button.center(), 38.0, Color32::from_black_alpha(if play.hovered() { 200 } else { 150 }));
             play_triangle(painter, button.center(), 15.0, Color32::WHITE);
-            if play.clicked() {
+            // A clip that plays here starts from a click anywhere on it, like a paused one.
+            if play.clicked() || (here && area_clicked) {
                 if here {
                     self.toggle_playback();
                 } else {
                     crate::window::open_link(&path.to_string_lossy());
                 }
             }
+        }
+
+        if self.rejected.contains(&shot) && self.zoom.is_none() {
+            let painter = ui.painter();
+            let g = painter.layout_no_wrap("Rejected".to_string(), theme::font(13.0), Color32::WHITE);
+            let r = Rect::from_center_size(pos2(area.center().x, area.min.y + 20.0), g.size() + vec2(44.0, 14.0));
+            painter.rect_filled(r, 16, Color32::from_rgba_unmultiplied(30, 30, 30, 215));
+            let c = pos2(r.min.x + 17.0, r.center().y);
+            painter.circle_filled(c, 10.0, theme::DELETE_RED);
+            x_mark(painter, c, 4.0, Color32::WHITE);
+            painter.galley(pos2(r.min.x + 34.0, r.min.y + 7.0), g, Color32::WHITE);
         }
 
         if self.picked.contains(&shot) && self.zoom.is_none() {
@@ -2583,6 +3028,7 @@ impl App {
             }
         }
         let max = [(area.width() * ppp).max(800.0) as u32, (area.height() * ppp).max(600.0) as u32];
+        self.viewer_px = max;
         let set = self.working_set();
         let pos = set.binary_search(&shot).unwrap_or_else(|i| i) as isize;
         // A loaded photo needs reloading if the window has grown well past its size.
@@ -2607,7 +3053,8 @@ impl App {
             .filter_map(|i| usize::try_from(i).ok().and_then(|i| set.get(i)).copied())
             .chain([shot])
             .collect();
-        self.fulls.retain(|s, _| keep.contains(s));
+        let read_ahead = &self.cache_keep;
+        self.fulls.retain(|s, _| keep.contains(s) || read_ahead.contains(s));
         if self.original.as_ref().is_some_and(|(s, _)| *s != shot) {
             self.original = None;
         }
@@ -2655,10 +3102,16 @@ impl eframe::App for App {
         self.frame_ui(ctx);
     }
 
-    /// Clear to fully transparent: every panel paints itself, except the top bar
-    /// under Windows 11 Mica, which must stay see-through.
+    /// Clear to see-through only while Windows 11's Mica shows in the top bar. Otherwise
+    /// the window is solid, so nothing behind it (the desktop on Windows 10, say) can
+    /// show through and wash out text.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4]
+        if self.mica_active {
+            [0.0; 4]
+        } else {
+            let c = self.p.bg;
+            [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+        }
     }
 }
 
@@ -2685,6 +3138,8 @@ impl App {
             /// The mouse's back button (usually "Mouse 4", the side button nearer you).
             back: bool,
             delete: bool,
+            reject: bool,
+            copy: bool,
             open: bool,
             settings: bool,
             play: bool,
@@ -2716,6 +3171,8 @@ impl App {
             end: binds.pressed(KeyAction::Last, i),
             back: i.pointer.button_pressed(egui::PointerButton::Extra1),
             delete: binds.pressed(KeyAction::Delete, i),
+            reject: binds.pressed(KeyAction::Reject, i),
+            copy: binds.pressed(KeyAction::Copy, i),
             settings: binds.pressed(KeyAction::Settings, i),
             play: binds.pressed(KeyAction::PlayPause, i),
             skip_back: binds.pressed(KeyAction::SkipBack, i),
@@ -2748,6 +3205,12 @@ impl App {
         }
         if k.export && self.folder.is_some() && self.range_mode == RangeMode::Off {
             self.quick_export();
+        }
+        if k.copy && self.folder.is_some() && self.range_mode == RangeMode::Off {
+            self.copy_selected(ctx);
+        }
+        if k.reject && self.folder.is_some() && self.range_mode == RangeMode::Off {
+            self.reject_selected();
         }
         if k.delete && self.folder.is_some() && self.range_mode == RangeMode::Off {
             self.request_delete();
@@ -2821,7 +3284,8 @@ impl App {
         let margin = if self.fullscreen {
             Margin::ZERO
         } else if viewer {
-            Margin::same(24)
+            // Little at the bottom: the strip's tab sits just above the bar's line.
+            Margin { left: 24, right: 24, top: 4, bottom: 4 }
         } else if self.folder.is_some() {
             // Grid: the scroll bar sits against the window's right edge.
             Margin { left: 16, right: 2, top: 12, bottom: 0 }
@@ -2846,6 +3310,7 @@ impl App {
         self.update_dialog(ctx);
         self.poll_drive_scan(ctx);
         self.drive_scan_dialog(ctx);
+        self.read_ahead();
         self.draw_toast(ctx);
         self.draw_drop_overlay(ctx);
         self.draw_drag_out_overlay(ctx);
@@ -2896,6 +3361,7 @@ impl App {
                             (SettingsPage::DragDrop, "Drag & Drop"),
                             (SettingsPage::ExportOnPick, "Export on Pick"),
                             (SettingsPage::Keybinds, "Keybinds"),
+                            (SettingsPage::Memory, "Memory"),
                             (SettingsPage::Themes, "Themes"),
                         ];
                         for (target, label) in pages {
@@ -2919,6 +3385,7 @@ impl App {
                         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match page {
                             SettingsPage::Keybinds => keybind_change = keybinds_page(ui, &p, &self.settings.keybinds, self.rebinding),
                             SettingsPage::DragDrop => drag_page(ui, &p, &mut self.settings),
+                            SettingsPage::Memory => memory_page(ui, &p, &mut self.settings),
                             SettingsPage::ExportOnPick => export_action = export_page(ui, &p, &mut self.settings),
                             SettingsPage::Themes => chosen_theme = themes_page(ui, &p, self.theme_shown),
                         });
@@ -3030,6 +3497,60 @@ fn drag_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
             .color(p.label2)
             .italics(),
     );
+}
+
+/// The Memory page: "Use less memory", or how much memory photos read ahead may take.
+fn memory_page(ui: &mut Ui, p: &Palette, settings: &mut Settings) {
+    ui.horizontal(|ui| {
+        if toggle_switch(ui, p, settings.memory_saver).clicked() {
+            settings.memory_saver = !settings.memory_saver;
+            settings.save();
+        }
+        ui.label(RichText::new("Use less memory").font(theme::font_semibold(14.0)));
+    });
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "On: Cullery keeps only the photos just around the one you're viewing. Best for computers \
+             with little memory.",
+        )
+        .color(p.label2),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Off: Cullery reads the photos around the one you're viewing ahead of time and keeps them, \
+             so moving through a shoot doesn't wait. Small versions of every photo come first, then \
+             sharp ones with the memory left over.",
+        )
+        .color(p.label2),
+    );
+
+    let total = crate::platform::total_memory();
+    ui.add_space(14.0);
+    ui.add_enabled_ui(!settings.memory_saver, |ui| {
+        ui.label(RichText::new("Memory for photos").font(theme::font_semibold(13.5)));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = 220.0;
+            let (lo, hi) = crate::settings::MEMORY_PERCENT;
+            let slider = ui.add(Slider::new(&mut settings.memory_percent, lo..=hi).step_by(1.0).show_value(false));
+            let gb = |percent: f32| total.map(|t| t as f64 * percent as f64 / 100.0 / 1e9);
+            let text = match (gb(settings.memory_percent), total) {
+                (Some(gb), Some(t)) => format!("{gb:.1} GB  ({:.0}% of {:.0} GB)", settings.memory_percent, t as f64 / 1e9),
+                _ => format!("{:.0}% of this computer's memory", settings.memory_percent),
+            };
+            ui.label(RichText::new(text).font(theme::font_semibold(13.0)));
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                settings.save();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Cullery may use up to this much for photos. More keeps more of a big shoot ready.")
+                .color(p.label2),
+        );
+    });
 }
 
 /// The Export on Pick page. Returns anything that needs the app (a folder dialog).
@@ -3319,6 +3840,30 @@ fn system_double_click_time() -> f64 {
     0.55
 }
 
+/// A folder's path, shortened when it's more than three folders deep: the first
+/// folder and the last, with "..." between (`C:\Users\...\Wedding`).
+fn short_path(dir: &Path) -> String {
+    use std::path::Component;
+    let names: Vec<String> = dir
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if names.len() <= 3 {
+        return dir.display().to_string();
+    }
+    // The drive (`C:\`) or `/`: everything before the first folder.
+    let root: String = dir
+        .components()
+        .take_while(|c| !matches!(c, Component::Normal(_)))
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let sep = std::path::MAIN_SEPARATOR;
+    format!("{root}{}{sep}...{sep}{}", names[0], names[names.len() - 1])
+}
+
 fn folder_name(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -3471,6 +4016,37 @@ fn scrollbar(ui: &Ui, p: &Palette, rect: Rect, offset: f32, content_h: f32, view
 
     let new = new.clamp(0.0, max_off);
     ((new - offset).abs() > 0.01).then_some(new)
+}
+
+/// The order to read photos ahead in: the one at `anchor`, then two after it for every
+/// one before it, outward until the set runs out.
+fn read_ahead_order(set: &[usize], anchor: usize) -> Vec<usize> {
+    let Some(last) = set.len().checked_sub(1) else { return Vec::new() };
+    let here = match set.binary_search(&anchor) {
+        Ok(i) | Err(i) => i.min(last),
+    };
+    let mut order = vec![set[here]];
+    let (mut ahead, mut behind) = (here + 1, here);
+    while order.len() < set.len() {
+        for _ in 0..2 {
+            if ahead <= last {
+                order.push(set[ahead]);
+                ahead += 1;
+            }
+        }
+        if behind > 0 {
+            behind -= 1;
+            order.push(set[behind]);
+        }
+    }
+    order
+}
+
+/// A "✕" centered on `c`, `s` from its middle to each arm's end.
+fn x_mark(painter: &egui::Painter, c: Pos2, s: f32, color: Color32) {
+    let stroke = Stroke::new(2.0_f32, color);
+    painter.line_segment([c + vec2(-s, -s), c + vec2(s, s)], stroke);
+    painter.line_segment([c + vec2(-s, s), c + vec2(s, -s)], stroke);
 }
 
 /// Four corner brackets: pointing out for "full screen", in for "exit full screen".
@@ -3922,6 +4498,85 @@ mod tests {
         h.app.reload_picks();
         assert_eq!(h.app.picked, [1].into_iter().collect(), "the first card's pick came back");
         cleanup(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_paths_are_shortened() {
+        assert_eq!(short_path(Path::new(r"C:\Users\name\Pictures\Shoot\Wedding")), r"C:\Users\...\Wedding");
+        assert_eq!(short_path(Path::new(r"F:\DCIM\100CANON")), r"F:\DCIM\100CANON");
+        assert_eq!(short_path(Path::new(r"D:\Photos\2026\June")), r"D:\Photos\2026\June");
+        assert_eq!(short_path(Path::new(r"F:\")), r"F:\");
+    }
+
+    #[test]
+    fn reads_two_ahead_for_every_one_behind() {
+        let set: Vec<usize> = (0..10).collect();
+        assert_eq!(read_ahead_order(&set, 4), [4, 5, 6, 3, 7, 8, 2, 9, 1, 0]);
+        assert_eq!(read_ahead_order(&set, 9), [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+        assert_eq!(read_ahead_order(&[2, 5, 9], 6), [9, 5, 2], "a photo outside the set starts at the next one");
+        assert!(read_ahead_order(&[], 0).is_empty());
+    }
+
+    /// Rejecting marks photos to delete later: never picked at the same time, shown
+    /// together by View Rejected, and remembered.
+    #[test]
+    fn rejects_and_view_rejected() {
+        let (mut h, dir) = harness_with_files("rejects");
+        h.app.settings.export_on_pick = false;
+        h.app.reload_picks();
+        h.app.selected = [1].into_iter().collect();
+        h.app.pick_selected();
+
+        h.app.selected = [1, 2].into_iter().collect();
+        h.app.reject_selected();
+        assert_eq!(h.app.rejected, [1, 2].into_iter().collect());
+        assert!(h.app.picked.is_empty(), "a rejected photo isn't picked");
+
+        h.app.set_view_rejected(true);
+        assert_eq!(h.app.working_set(), vec![1, 2]);
+        h.app.set_view_picked(true);
+        assert!(!h.app.view_rejected, "only one view at a time");
+        h.app.set_view_picked(false);
+
+        h.app.selected = [2].into_iter().collect();
+        h.app.pick_selected();
+        assert_eq!(h.app.rejected, [1].into_iter().collect(), "picking undoes a reject");
+
+        h.app.reload_picks();
+        assert_eq!(h.app.rejected, [1].into_iter().collect(), "rejects are remembered");
+        if let Some(f) = picks::file_for(&dir) {
+            let _ = std::fs::remove_file(f.parent().unwrap().parent().unwrap().join("rejects").join(f.file_name().unwrap()));
+        }
+        cleanup(&dir);
+    }
+
+    /// The viewer's strip: clicking a photo in it shows that photo, and its tab hides
+    /// and shows the strip.
+    #[test]
+    fn viewer_strip_jumps_and_hides() {
+        let mut h = Harness::new();
+        h.app.settings.filmstrip = true;
+        h.app.open_viewer(10);
+        for _ in 0..20 {
+            h.frame(vec![], 0.05);
+        }
+        let cell = h.ctx.read_response(Id::new(("strip", 12usize))).expect("photo 12 is in the strip").rect.center();
+        h.frame(vec![Event::PointerMoved(cell)], 0.016);
+        h.frame(vec![Harness::button(cell, true)], 0.05);
+        h.frame(vec![Harness::button(cell, false)], 0.016);
+        assert_eq!(h.app.current, 12);
+
+        let tab = h.ctx.read_response(Id::new("strip-tab")).unwrap().rect.center();
+        h.frame(vec![Event::PointerMoved(tab)], 0.016);
+        h.frame(vec![Harness::button(tab, true)], 0.05);
+        h.frame(vec![Harness::button(tab, false)], 0.016);
+        h.frame(vec![], 0.016);
+        h.frame(vec![], 0.016);
+        assert!(!h.app.settings.filmstrip, "the tab hid the strip");
+        assert!(h.ctx.read_response(Id::new(("strip", 12usize))).is_none());
+        let hidden_tab = h.ctx.read_response(Id::new("strip-tab")).unwrap().rect;
+        assert!(hidden_tab.min.y > tab.y, "the tab moved down to the bar");
     }
 
     /// F fills the screen in the viewer; Esc leaves full screen first, then the viewer.

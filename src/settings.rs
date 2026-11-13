@@ -36,11 +36,21 @@ pub fn data_dir() -> Option<PathBuf> {
 }
 
 const MAX_RECENT: usize = 8;
+/// The range of the memory slider, in percent of the computer's memory.
+pub const MEMORY_PERCENT: (f32, f32) = (1.0, 50.0);
 
 pub struct Settings {
     pub export_dir: Option<PathBuf>,
     pub recent: Vec<PathBuf>,
     pub show_raw: bool,
+    /// The strip of photos under the viewer is showing.
+    pub filmstrip: bool,
+    /// The details bar along the top of the viewer is showing.
+    pub info_bar: bool,
+    /// "Use less memory": keep only the photos around the one on show, as before.
+    pub memory_saver: bool,
+    /// Otherwise, the share of the computer's memory (percent) photos may take.
+    pub memory_percent: f32,
     pub tile_width: f32,
     pub drag_files: DragFiles,
     pub theme: ThemeId,
@@ -61,6 +71,10 @@ struct Snapshot {
     export_dir: Option<PathBuf>,
     recent: Vec<PathBuf>,
     show_raw: bool,
+    filmstrip: bool,
+    info_bar: bool,
+    memory_saver: bool,
+    memory_percent: f32,
     tile_width: f32,
     drag_files: DragFiles,
     theme: ThemeId,
@@ -134,9 +148,13 @@ impl Default for Settings {
             export_dir: None,
             recent: Vec::new(),
             show_raw: false,
+            filmstrip: true,
+            info_bar: true,
+            memory_saver: false,
+            memory_percent: 5.0,
             tile_width: 190.0,
             drag_files: DragFiles::Raw,
-            theme: ThemeId::AppleDark,
+            theme: ThemeId::Win11Dark,
             export_on_pick: false,
             export_files: DragFiles::Both,
             sort_by: SortBy::Name,
@@ -157,6 +175,10 @@ impl Settings {
             export_dir: s.export_dir.clone(),
             recent: s.recent.clone(),
             show_raw: s.show_raw,
+            filmstrip: s.filmstrip,
+            info_bar: s.info_bar,
+            memory_saver: s.memory_saver,
+            memory_percent: s.memory_percent,
             tile_width: s.tile_width,
             drag_files: s.drag_files,
             theme: s.theme,
@@ -174,6 +196,10 @@ impl Settings {
             export_dir: self.export_dir.clone(),
             recent: self.recent.clone(),
             show_raw: self.show_raw,
+            filmstrip: self.filmstrip,
+            info_bar: self.info_bar,
+            memory_saver: self.memory_saver,
+            memory_percent: self.memory_percent,
             tile_width: self.tile_width,
             drag_files: self.drag_files,
             theme: self.theme,
@@ -201,6 +227,14 @@ impl Settings {
                 "export" if !value.is_empty() => s.export_dir = Some(PathBuf::from(value)),
                 "recent" if !value.is_empty() => s.recent.push(PathBuf::from(value)),
                 "show_raw" => s.show_raw = value == "1",
+                "filmstrip" => s.filmstrip = value == "1",
+                "info_bar" => s.info_bar = value == "1",
+                "memory_saver" => s.memory_saver = value == "1",
+                "memory_percent" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        s.memory_percent = v.clamp(MEMORY_PERCENT.0, MEMORY_PERCENT.1);
+                    }
+                }
                 "theme" => {
                     if let Some(t) = ThemeId::from_key(value) {
                         s.theme = t;
@@ -264,6 +298,18 @@ impl Settings {
         if mine.recent != base.recent {
             merged.recent = mine.recent.clone();
         }
+        if mine.memory_saver != base.memory_saver {
+            merged.memory_saver = mine.memory_saver;
+        }
+        if mine.memory_percent != base.memory_percent {
+            merged.memory_percent = mine.memory_percent;
+        }
+        if mine.info_bar != base.info_bar {
+            merged.info_bar = mine.info_bar;
+        }
+        if mine.filmstrip != base.filmstrip {
+            merged.filmstrip = mine.filmstrip;
+        }
         if mine.show_raw != base.show_raw {
             merged.show_raw = mine.show_raw;
         }
@@ -300,6 +346,10 @@ impl Settings {
             text += &format!("recent={}\n", dir.display());
         }
         text += &format!("show_raw={}\n", if merged.show_raw { 1 } else { 0 });
+        text += &format!("filmstrip={}\n", if merged.filmstrip { 1 } else { 0 });
+        text += &format!("info_bar={}\n", if merged.info_bar { 1 } else { 0 });
+        text += &format!("memory_saver={}\n", if merged.memory_saver { 1 } else { 0 });
+        text += &format!("memory_percent={}\n", merged.memory_percent.round());
         text += &format!("tile_width={}\n", merged.tile_width.round());
         text += &format!("drag_files={}\n", merged.drag_files.key());
         text += &format!("theme={}\n", merged.theme.key());
@@ -363,6 +413,10 @@ mod tests {
         s.export_dir = Some(PathBuf::from(r"D:\Selects"));
         s.add_recent(PathBuf::from(r"F:\DCIM\100CANON"));
         s.show_raw = true;
+        s.filmstrip = false;
+        s.info_bar = false;
+        s.memory_saver = true;
+        s.memory_percent = 12.0;
         s.tile_width = 240.0;
         s.drag_files = DragFiles::Both;
         s.theme = ThemeId::Win10Light;

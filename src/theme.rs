@@ -18,13 +18,14 @@ pub enum ThemeId {
 }
 
 impl ThemeId {
+    /// In the order Settings shows them, two to a row.
     pub const ALL: [ThemeId; 6] = [
-        ThemeId::AppleDark,
-        ThemeId::AppleLight,
         ThemeId::Win11Dark,
         ThemeId::Win11Light,
         ThemeId::Win10Dark,
         ThemeId::Win10Light,
+        ThemeId::AppleDark,
+        ThemeId::AppleLight,
     ];
 
     /// Name stored in the settings file.

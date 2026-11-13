@@ -73,6 +73,8 @@ const ANIMATION_BYTES: usize = 256 * 1024 * 1024;
 struct Queues {
     full: Vec<Request>,
     thumbs: Vec<Request>,
+    /// Photos read ahead of time to keep in memory: only when nothing else waits.
+    background: Vec<Request>,
     in_flight: HashSet<Key>,
     generation: u64,
     shutdown: bool,
@@ -111,6 +113,7 @@ impl Loader {
         q.generation += 1;
         q.full.clear();
         q.thumbs.clear();
+        q.background.clear();
         q.in_flight.clear();
         q.generation
     }
@@ -123,6 +126,17 @@ impl Loader {
     /// Replace the queue of grid thumbnails (highest priority first).
     pub fn want_thumbs(&self, requests: Vec<Request>) {
         self.replace(requests, |q| &mut q.thumbs);
+    }
+
+    /// Replace the queue of photos to read ahead of time (nearest first). They're read
+    /// only while nothing else is waiting.
+    pub fn want_background(&self, mut requests: Vec<Request>) {
+        {
+            let (lock, _) = &*self.shared;
+            let q = lock.lock().unwrap();
+            requests.retain(|r| !q.full.iter().chain(&q.thumbs).any(|o| o.key == r.key));
+        }
+        self.replace(requests, |q| &mut q.background);
     }
 
     fn replace(&self, mut requests: Vec<Request>, queue: impl Fn(&mut Queues) -> &mut Vec<Request>) {
@@ -172,6 +186,8 @@ fn worker(shared: Arc<(Mutex<Queues>, Condvar)>, tx: Sender<Loaded>, ctx: egui::
                     Some(q.full.remove(0))
                 } else if !q.thumbs.is_empty() {
                     Some(q.thumbs.remove(0))
+                } else if !q.background.is_empty() {
+                    Some(q.background.remove(0))
                 } else {
                     None
                 };
@@ -394,7 +410,64 @@ fn raw_previews(path: &Path) -> Result<Arc<raw::Previews>, String> {
 
 /// Shows a RAW file using the JPEG the camera embedded in it: the smallest one
 /// that's big enough for what's being drawn.
+/// A RAW is shown from the JPEG preview the camera saved inside it. Only a RAW without
+/// one is developed from its sensor data, which takes much longer.
 fn decode_raw(path: &Path, kind: Kind, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    let has_preview = raw_previews(path).is_ok_and(|p| p.largest().is_some());
+    match (has_preview, kind) {
+        (true, _) => decode_raw_preview(path, kind, max),
+        // The quick first look has nothing to show; the Thumb request develops it.
+        (false, Kind::Preview) => Err("no embedded preview".into()),
+        (false, _) => develop_raw(path, max),
+    }
+}
+
+/// Develops a RAW from its sensor data, for RAWs that come without a preview. The last
+/// few are kept, since the grid, the viewer and zooming each ask for the same file.
+fn develop_raw(path: &Path, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
+    static DEVELOPED: Mutex<Vec<(PathBuf, Arc<RgbaImage>)>> = Mutex::new(Vec::new());
+    let cached = DEVELOPED.lock().unwrap().iter().find(|(p, _)| p == path).map(|(_, img)| img.clone());
+    let full = match cached {
+        Some(img) => img,
+        None => {
+            let failed = |e: String| format!("Couldn't develop this RAW: {e}");
+            let raw = rawler::decode_file(path).map_err(|e| failed(e.to_string()))?;
+            let orientation = match raw.orientation {
+                rawler::Orientation::HorizontalFlip => 2,
+                rawler::Orientation::Rotate180 => 3,
+                rawler::Orientation::VerticalFlip => 4,
+                rawler::Orientation::Transpose => 5,
+                rawler::Orientation::Rotate90 => 6,
+                rawler::Orientation::Transverse => 7,
+                rawler::Orientation::Rotate270 => 8,
+                _ => 1,
+            };
+            let developed = rawler::imgop::develop::RawDevelop::default()
+                .develop_intermediate(&raw)
+                .map_err(|e| failed(e.to_string()))?
+                .to_dynamic_image()
+                .ok_or_else(|| failed("unsupported sensor layout".into()))?;
+            let img = Arc::new(orient(developed.into_rgba8(), orientation));
+            let mut list = DEVELOPED.lock().unwrap();
+            list.push((path.to_path_buf(), img.clone()));
+            if list.len() > 3 {
+                list.remove(0);
+            }
+            img
+        }
+    };
+    let original = [full.width(), full.height()];
+    let fitted = if full.width() <= max[0] && full.height() <= max[1] {
+        (*full).clone()
+    } else {
+        let scale = (max[0] as f32 / full.width() as f32).min(max[1] as f32 / full.height() as f32);
+        let (w, h) = (((full.width() as f32 * scale).round() as u32).max(1), ((full.height() as f32 * scale).round() as u32).max(1));
+        imageops::resize(&*full, w, h, imageops::FilterType::Triangle)
+    };
+    Ok((to_color_image(&fitted), original))
+}
+
+fn decode_raw_preview(path: &Path, kind: Kind, max: [u32; 2]) -> Result<(ColorImage, [u32; 2]), String> {
     let previews = raw_previews(path)?;
     let choice = match kind {
         Kind::Preview => previews.smallest(),
@@ -611,6 +684,47 @@ mod tests {
                 start.elapsed()
             );
             assert!(full.size[0] <= 2560 && full.size[1] <= 1440);
+        }
+    }
+
+    /// Develops RAWs from their sensor data (as for RAWs with no preview) and times it:
+    /// `$env:CULLERY_DEVELOP_SAMPLES='F:\DCIM\100CANON'; cargo test --release develop_samples -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn develop_samples() {
+        let Some(dir) = std::env::var_os("CULLERY_DEVELOP_SAMPLES") else { return };
+        let mut raws: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(raw::is_raw_extension))
+            .collect();
+        raws.sort();
+        for path in raws.iter().take(3) {
+            let started = std::time::Instant::now();
+            let developed = develop_raw(path, [2560, 1440]);
+            let first = started.elapsed();
+            let again = std::time::Instant::now();
+            let _ = develop_raw(path, [2560, 1440]);
+            // Average colour, against the camera's own preview of the same shot.
+            let mean = |img: &ColorImage| {
+                let n = img.pixels.len().max(1) as f64;
+                let sum = img.pixels.iter().fold([0.0; 3], |s, c| [s[0] + c.r() as f64, s[1] + c.g() as f64, s[2] + c.b() as f64]);
+                sum.map(|v| (v / n).round())
+            };
+            let preview = decode_raw_preview(path, Kind::Full, [2560, 1440]).ok().map(|(img, _)| mean(&img));
+            match developed {
+                Ok((img, original)) => println!(
+                    "{}: {:?} shown at {:?}, developed in {:.2}s, again from memory in {:.2}s; average RGB {:?}, camera preview {:?}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    original,
+                    img.size,
+                    first.as_secs_f64(),
+                    again.elapsed().as_secs_f64(),
+                    mean(&img),
+                    preview
+                ),
+                Err(e) => println!("{}: {e}", path.display()),
+            }
         }
     }
 }

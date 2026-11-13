@@ -321,6 +321,51 @@ mod tests {
     }
 }
 
+/// Puts `paths` on the clipboard as files, for pasting into a folder in File Explorer
+/// (or anything else that takes pasted files).
+#[cfg(windows)]
+pub fn copy_files(paths: &[PathBuf]) -> Result<(), String> {
+    use windows::Win32::System::Ole::{OleFlushClipboard, OleSetClipboard};
+    let data = shell_data_object(paths)?;
+    // SAFETY: called on the window's thread, where OLE is set up. Flushing hands the
+    // files to Windows, so they can still be pasted after Cullery closes.
+    unsafe {
+        OleSetClipboard(&data).map_err(|e| e.message().to_string())?;
+        let _ = OleFlushClipboard();
+    }
+    Ok(())
+}
+
+/// Puts `paths` on the clipboard as files, for pasting into a folder in Finder.
+#[cfg(target_os = "macos")]
+pub fn copy_files(paths: &[PathBuf]) -> Result<(), String> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2_foundation::{NSString, NSURL};
+
+    let class = |name: &std::ffi::CStr| AnyClass::get(name).ok_or_else(|| "The clipboard isn't available".to_string());
+    // SAFETY: standard AppKit and Foundation calls with the argument types they declare.
+    unsafe {
+        let board: Option<Retained<AnyObject>> = msg_send![class(c"NSPasteboard")?, generalPasteboard];
+        let board = board.ok_or("The clipboard isn't available")?;
+        let list: Option<Retained<AnyObject>> = msg_send![class(c"NSMutableArray")?, array];
+        let list = list.ok_or("The clipboard isn't available")?;
+        for path in paths {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+            let _: () = msg_send![&*list, addObject: &*url];
+        }
+        let _: isize = msg_send![&*board, clearContents];
+        let written: bool = msg_send![&*board, writeObjects: &*list];
+        if written { Ok(()) } else { Err("The files couldn't be put on the clipboard".into()) }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn copy_files(_paths: &[PathBuf]) -> Result<(), String> {
+    Err("Copying files isn't supported on this system".into())
+}
+
 /// Starts dragging `paths` out of the window whose NSView is `view`, as a copy, with
 /// `image` under the cursor. Unlike Windows, macOS returns at once and the app keeps
 /// running during the drag; `on_end` runs on the drop or cancel.

@@ -1,19 +1,29 @@
-## What's new in 1.2.0
+## What's new in 1.3.0
 
-### Video mode
+### Culling
 
-- **Photos / Videos switch:** folders with both get a switch in the top bar. Each side keeps its own picks.
-- **Clips in the grid:** MP4, MOV, M4V, MTS and M2TS clips show with a frame from the clip as their thumbnail.
-- **RAW video pairs up:** Canon CRM, Blackmagic BRAW and RED R3D files pair with the clip of the same name, the same way JPG and RAW photos do.
-- **Play right in Cullery:** MP4 and MOV clips play in the viewer, with sound. Drag the bar to scrub, and the volume you set carries over to every clip.
-- **Video shortcuts:** K plays and pauses, J and L jump 5 seconds, and F goes full screen.
-- **RAW clips** open in your usual video player.
-- **Same tools as photos:** picking, Quick Export, drag out and delete all work on clips.
+- **Reject photos:** press **X** to mark a photo for deleting later (again to undo). Rejected photos are dimmed with a red ✕. A photo is never both picked and rejected.
+- **View Rejected:** sits next to View Picked and shows only your rejects. Select all (Ctrl+A) and press Delete to clear them in one go.
+- **Copy files:** **Ctrl+C** copies the selected photos, to paste straight into a folder.
 
-### Also new
+### Viewer
 
-- **F works for photos too:** the viewer fills the screen with just the photo. Esc leaves full screen.
-- **Changeable shortcuts:** play / pause, skip and full screen can be changed in Settings → Keybinds.
+- **Photo strip:** a row of photos along the bottom, centered on the one you're viewing. Click one to jump to it. The small tab above it hides and shows it.
+- **Details bar:** one line along the top with where the file is (click to open the folder), its resolution, when it was taken, the camera, shutter speed, aperture, ISO and lens. It hides the same way.
+- **Clips start with a click** anywhere on them.
+
+### Speed
+
+- **Photos read ahead:** Cullery now loads the photos around the one you're viewing in the background and keeps them, small versions of every photo first, then sharp ones. Moving through a shoot rarely waits.
+- **Memory setting:** Settings → Memory sets how much memory this may use (5% of your computer's by default). Turn on **Use less memory** for exactly the old behavior.
+- **RAWs without a preview** are now developed from the sensor data, instead of showing nothing.
+
+### Also
+
+- **Windows 11 is the default theme** for new installs, and the Themes page lists Windows 11, Windows 10, then Apple.
+- **Opening a whole drive** lists every drive, and shows all its photos, including subfolders.
+- **Long folder paths** are shortened in the top bar (hover for the full path).
+- **Windows 10:** the window no longer lets the desktop show through behind text.
 
 ## Install
 

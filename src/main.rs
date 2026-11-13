@@ -7,6 +7,7 @@ mod devices;
 mod dragimage;
 mod dragout;
 mod export;
+mod info;
 mod keybinds;
 mod library;
 mod loader;
