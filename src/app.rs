@@ -341,6 +341,12 @@ pub struct App {
     content_rect: Rect,
     /// Text shown in the bottom bar; `true` marks an error.
     message: Option<(String, bool)>,
+    /// The window was asked to close while photos were still copying.
+    confirm_close: bool,
+    /// Close as soon as the copying ends.
+    close_when_done: bool,
+    /// The user chose to close; let the close through.
+    closing: bool,
 }
 
 impl App {
@@ -501,6 +507,9 @@ impl App {
             toast: None,
             content_rect: Rect::NOTHING,
             message: None,
+            confirm_close: false,
+            close_when_done: false,
+            closing: false,
         }
     }
 
@@ -2151,6 +2160,118 @@ impl App {
         }
     }
 
+    /// A small card in the top-right corner while photos copy: where they're going, a
+    /// bar, and how many files are done.
+    fn export_progress(&mut self, ctx: &egui::Context) {
+        let Some((done, total, dest)) = self.exporter.progress() else { return };
+        let p = self.p;
+        let title = format!("Exporting to {}", folder_name(dest));
+        let mut keep_open = false;
+        let anchor = pos2(self.content_rect.max.x - 16.0, self.content_rect.min.y + 12.0);
+        egui::Area::new(Id::new("export-progress"))
+            .order(Order::Foreground)
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(anchor)
+            .interactable(true)
+            .show(ctx, |ui| {
+                Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(14)).show(ui, |ui| {
+                    const W: f32 = 260.0;
+                    ui.set_width(W);
+                    ui.add(egui::Label::new(RichText::new(title).font(theme::font_semibold(13.5)).color(p.label)).truncate());
+                    ui.add_space(8.0);
+                    let fraction = done as f32 / total.max(1) as f32;
+                    ui.add(egui::ProgressBar::new(fraction).desired_width(W).desired_height(6.0).fill(p.accent).corner_radius(p.r_pill));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{done} of {total} {}", plural(total, "file", "files"))).color(p.label2).size(12.5));
+                        if self.close_when_done {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let r = ui.add(egui::Label::new(RichText::new("Closes when done · Keep open").color(p.tint).size(12.5)).sense(Sense::click()));
+                                keep_open = r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                            });
+                        }
+                    });
+                });
+            });
+        if keep_open {
+            self.close_when_done = false;
+        }
+    }
+
+    /// Holds the window open while photos are copying, and asks first. Closes it once
+    /// they're done, if the user chose Close When Done.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        let copying = self.exporter.pending() > 0;
+        if ctx.input(|i| i.viewport().close_requested()) && copying && !self.closing {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            if !self.close_when_done {
+                self.confirm_close = true;
+            }
+        }
+        if self.close_when_done && !copying {
+            self.close_when_done = false;
+            self.closing = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    /// "Photos are still exporting": wait and close, stop and close, or keep going.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_close {
+            return;
+        }
+        let Some((done, total, dest)) = self.exporter.progress() else {
+            // Finished while the question was up: nothing left to lose.
+            self.confirm_close = false;
+            self.closing = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        };
+        let p = self.p;
+        let left = total - done;
+        let (mut wait, mut stop, mut cancel) = (false, false, false);
+        let modal = egui::Modal::new(Id::new("confirm-close"))
+            .frame(Frame::window(&ctx.style()).fill(p.card).corner_radius(p.r_card).inner_margin(Margin::same(20)))
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(RichText::new("Photos are still exporting").font(theme::font_semibold(17.0)));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{left} of {total} {} still to copy to {}.",
+                        plural(total, "file", "files"),
+                        folder_name(dest)
+                    ))
+                    .color(p.label),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("Stopping now leaves those files uncopied. Files already copied are kept.").color(p.label2));
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let primary = Button::new(RichText::new("Close When Done").color(p.on_accent).font(theme::font_semibold(13.5)))
+                        .fill(p.accent)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(p.r_ctl)
+                        .min_size(vec2(130.0, 32.0));
+                    wait = ui.add(primary).clicked();
+                    stop = ui.add(Button::new("Stop and Close").corner_radius(p.r_ctl).min_size(vec2(110.0, 32.0))).clicked();
+                    cancel = ui.add(Button::new("Keep Open").corner_radius(p.r_ctl).min_size(vec2(96.0, 32.0))).clicked();
+                });
+            });
+        if wait {
+            self.close_when_done = true;
+        }
+        if stop {
+            // The file being copied finishes (no half files); the rest are skipped.
+            self.exporter.stop();
+            self.closing = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if wait || stop || cancel || modal.should_close() {
+            self.confirm_close = false;
+        }
+    }
+
     /// Starts deleting these shots' files in the background. `finish_delete` takes over
     /// when they're gone.
     fn delete_shots(&mut self, ctx: &egui::Context, shots: &[usize], permanent: bool) {
@@ -2321,10 +2442,7 @@ impl App {
     fn picked_badge(&self, ui: &mut Ui) {
         let p = self.p;
         let files: usize = self.picked.iter().map(|&s| self.shots[s].files().count()).sum();
-        let mut text = format!("✔  {} Picked · {} files", self.picked.len(), files);
-        if self.exporter.pending() > 0 {
-            text += "  · copying…";
-        }
+        let text = format!("✔  {} Picked · {} files", self.picked.len(), files);
         Frame::new()
             .fill(p.tint_bg)
             .corner_radius(p.r_pill)
@@ -3129,6 +3247,7 @@ impl App {
         }
         self.receive(ctx);
         self.finish_delete(ctx);
+        self.guard_close(ctx);
 
         self.handle_drops(ctx);
         self.start_pending_drag(ctx);
@@ -3181,7 +3300,13 @@ impl App {
         });
         // While the delete confirmation is up, it gets the keys (Esc cancels it); while
         // a delete runs, nothing should touch the photos.
-        if self.confirm_delete.is_some() || self.deleting.is_some() || self.update_prompt || self.drive_scan.is_some() || capturing {
+        if self.confirm_delete.is_some()
+            || self.deleting.is_some()
+            || self.update_prompt
+            || self.confirm_close
+            || self.drive_scan.is_some()
+            || capturing
+        {
             k = Keys::default();
         }
         // Ctrl + , opens or closes Settings, as in many Windows apps.
@@ -3308,6 +3433,8 @@ impl App {
         self.delete_dialog(ctx);
         self.delete_progress(ctx);
         self.update_dialog(ctx);
+        self.export_progress(ctx);
+        self.close_dialog(ctx);
         self.poll_drive_scan(ctx);
         self.drive_scan_dialog(ctx);
         self.read_ahead();
@@ -5056,6 +5183,44 @@ mod tests {
         assert!(dir.join("IMG_0000.JPG").exists() && dir.join("IMG_0000.CR3").exists());
         assert!(h.app.selected.contains(&0), "Esc on the dialog doesn't clear the selection");
         cleanup(&dir);
+    }
+
+    /// Closing the window mid-export is held back and asked about; Close When Done
+    /// closes once the copying ends.
+    #[test]
+    fn closing_while_exporting_asks_first() {
+        let mut h = Harness::new();
+        let commands = |h: &mut Harness, close: bool| {
+            let mut input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0))),
+                time: Some(h.time),
+                ..Default::default()
+            };
+            if close {
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+            }
+            let app = &mut h.app;
+            let out = h.ctx.run(input, |ctx| app.frame_ui(ctx));
+            h.time += 0.016;
+            out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+        };
+        let cancelled = |c: &[ViewportCommand]| c.iter().any(|c| matches!(c, ViewportCommand::CancelClose));
+        let closed = |c: &[ViewportCommand]| c.iter().any(|c| matches!(c, ViewportCommand::Close));
+
+        // Nothing copying: the close goes through.
+        assert!(!cancelled(&commands(&mut h, true)));
+        assert!(!h.app.confirm_close);
+
+        h.app.exporter.pretend_busy(180, PathBuf::from(r"E:\Lightroom import"));
+        assert!(cancelled(&commands(&mut h, true)));
+        assert!(h.app.confirm_close, "asks first");
+        commands(&mut h, false);
+
+        h.app.close_when_done = true;
+        h.app.confirm_close = false;
+        assert!(!closed(&commands(&mut h, false)), "still copying");
+        h.app.exporter.pretend_done();
+        assert!(closed(&commands(&mut h, false)), "closes when the copying ends");
     }
 
     /// Runs frames until every background copy has finished.

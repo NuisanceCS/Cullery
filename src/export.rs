@@ -3,7 +3,7 @@
 //! overwrites one, and never deletes one.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -26,29 +26,59 @@ pub struct Exporter {
     done: Receiver<Done>,
     thread: Option<JoinHandle<()>>,
     pending: usize,
+    /// Files handed to the thread since it was last idle, and how many of them it has
+    /// dealt with (copied, found already there, or given up on).
+    queued: usize,
+    handled: Arc<AtomicUsize>,
+    /// Set to drop the copies not yet started (the app is closing).
+    stop: Arc<AtomicBool>,
+    /// Where the latest copy goes.
+    dest: Option<PathBuf>,
 }
 
 impl Exporter {
     pub fn new(ctx: eframe::egui::Context) -> Self {
         let (job_tx, job_rx) = channel::<Job>();
         let (done_tx, done_rx) = channel::<Done>();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (counter, stopping) = (handled.clone(), stop.clone());
         let thread = std::thread::Builder::new()
             .name("export".into())
             .spawn(move || {
                 for job in job_rx {
-                    let result = copy_files(&job.files, &job.dest);
+                    let mut counted = 0;
+                    let result = copy_files(&job.files, &job.dest, &stopping, || {
+                        counted += 1;
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        ctx.request_repaint();
+                    });
+                    // Files skipped after a failure still count, so the bar reaches the end.
+                    counter.fetch_add(job.files.len().saturating_sub(counted), Ordering::Relaxed);
                     let _ = done_tx.send(Done { batch: job.batch, result });
                     ctx.request_repaint();
                 }
             })
             .expect("failed to start export thread");
-        Self { jobs: Some(job_tx), done: done_rx, thread: Some(thread), pending: 0 }
+        Self {
+            jobs: Some(job_tx),
+            done: done_rx,
+            thread: Some(thread),
+            pending: 0,
+            queued: 0,
+            handled,
+            stop,
+            dest: None,
+        }
     }
 
     pub fn copy(&mut self, files: Vec<PathBuf>, dest: PathBuf, batch: Option<u64>) {
         if let Some(jobs) = &self.jobs {
+            let count = files.len();
+            self.dest = Some(dest.clone());
             if jobs.send(Job { files, dest, batch }).is_ok() {
                 self.pending += 1;
+                self.queued += count;
             }
         }
     }
@@ -56,12 +86,45 @@ impl Exporter {
     pub fn try_recv(&mut self) -> Option<Done> {
         let done = self.done.try_recv().ok()?;
         self.pending = self.pending.saturating_sub(1);
+        if self.pending == 0 {
+            // Idle: every file sent has been counted, so the next export starts at zero.
+            self.queued = 0;
+            self.handled.store(0, Ordering::Relaxed);
+        }
         Some(done)
     }
 
     /// Number of copy jobs still running.
     pub fn pending(&self) -> usize {
         self.pending
+    }
+
+    /// While copying: files done, files in all, and where they're going.
+    pub fn progress(&self) -> Option<(usize, usize, &Path)> {
+        if self.pending == 0 {
+            return None;
+        }
+        let done = self.handled.load(Ordering::Relaxed).min(self.queued);
+        Some((done, self.queued, self.dest.as_deref()?))
+    }
+
+    /// Lets the file being copied finish and skips the rest.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Tests: looks busy copying `files` files to `dest` until `pretend_done`.
+    #[cfg(test)]
+    pub fn pretend_busy(&mut self, files: usize, dest: PathBuf) {
+        self.pending += 1;
+        self.queued += files;
+        self.dest = Some(dest);
+    }
+
+    #[cfg(test)]
+    pub fn pretend_done(&mut self) {
+        self.pending = 0;
+        self.queued = 0;
     }
 }
 
@@ -108,12 +171,23 @@ pub fn existing_copy(src: &Path, dest: &Path) -> Option<PathBuf> {
     }
 }
 
-fn copy_files(files: &[PathBuf], dest: &Path) -> Result<(), String> {
+/// Copies `files` into `dest`, calling `handled` after each one (copied or already
+/// there). Stops early, without error, once `stop` is set.
+fn copy_files(files: &[PathBuf], dest: &Path, stop: &AtomicBool, mut handled: impl FnMut()) -> Result<(), String> {
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     std::fs::create_dir_all(dest).map_err(|e| format!("Couldn't create {}: {e}", dest.display()))?;
     for src in files {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let name = src.file_name().unwrap_or_default().to_string_lossy();
         let target = match copy_target(src, dest) {
-            Some(Target::Existing(_)) => continue,
+            Some(Target::Existing(_)) => {
+                handled();
+                continue;
+            }
             Some(Target::New(path)) => path,
             None => return Err(format!("Too many files named like {name} in the export folder")),
         };
@@ -125,6 +199,7 @@ fn copy_files(files: &[PathBuf], dest: &Path) -> Result<(), String> {
             let _ = std::fs::remove_file(&partial);
             format!("Couldn't copy {name}: {e}")
         })?;
+        handled();
     }
     Ok(())
 }
@@ -294,6 +369,45 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
+    /// Progress counts every file of every job, then starts over once idle; after
+    /// `stop`, jobs not yet started copy nothing.
+    #[test]
+    fn counts_progress_and_stops() {
+        let base = std::env::temp_dir().join(format!("cullery-export-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (card, dest) = (base.join("card"), base.join("export"));
+        std::fs::create_dir_all(&card).unwrap();
+        let files: Vec<PathBuf> = (0..12).map(|i| card.join(format!("{i}.jpg"))).collect();
+        for f in &files {
+            std::fs::write(f, b"photo").unwrap();
+        }
+        let mut exporter = Exporter::new(eframe::egui::Context::default());
+        let drain = |exporter: &mut Exporter| {
+            let mut last = None;
+            while exporter.pending() > 0 {
+                if exporter.try_recv().is_none() {
+                    last = exporter.progress().map(|(done, total, _)| (done, total)).or(last);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            last
+        };
+        exporter.copy(files[..5].to_vec(), dest.clone(), None);
+        exporter.copy(files[5..].to_vec(), dest.clone(), None);
+        assert_eq!(exporter.progress().map(|(_, total, _)| total), Some(12));
+        drain(&mut exporter);
+        assert!(exporter.progress().is_none(), "idle once everything is copied");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 12);
+
+        let other = base.join("other");
+        exporter.stop();
+        exporter.copy(files.clone(), other.clone(), None);
+        drain(&mut exporter);
+        assert!(!other.exists(), "nothing copied after stop");
+        drop(exporter);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     /// Same name and size but taken at a different time is a different photo; a
     /// whole-hour difference (daylight saving on a memory card) is still the same one.
     #[test]
@@ -334,9 +448,12 @@ mod tests {
         std::fs::write(dest.join("IMG_0001.JPG"), b"someone else's edit").unwrap();
 
         let files = vec![jpg.clone(), raw.clone()];
+        let stop = AtomicBool::new(false);
+        let mut handled = 0;
         for _ in 0..3 {
-            copy_files(&files, &dest).unwrap();
+            copy_files(&files, &dest, &stop, || handled += 1).unwrap();
         }
+        assert_eq!(handled, 6, "every file counts, copied or already there");
         let mut names: Vec<String> =
             std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         names.sort();
